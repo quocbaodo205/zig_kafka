@@ -1,31 +1,8 @@
 const std = @import("std");
 const net = std.net;
+const message_util = @import("message.zig");
 
 const ADMIN_PORT: u16 = 10000;
-const MessageType = enum(u8) {
-    ECHO = 1,
-    // Other message type here
-};
-
-const Message = union(MessageType) {
-    ECHO: []u8,
-};
-
-pub fn readFromStream(stream_rd: *net.Stream.Reader) !?[]u8 {
-    const header = try stream_rd.file_reader.interface.takeByte();
-    if (header != 0) {
-        const data = try stream_rd.file_reader.interface.take(header);
-        return data;
-    } else {
-        return null;
-    }
-}
-
-pub fn writeToStream(stream_wr: *net.Stream.Writer, data: []u8) !void {
-    try stream_wr.interface.writeByte(@intCast(data.len)); // Send how many byte written
-    try stream_wr.interface.writeAll(data);
-    try stream_wr.interface.flush();
-}
 
 pub const KAdmin = struct {
     const Self = @This();
@@ -34,6 +11,11 @@ pub const KAdmin = struct {
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
 
+    // A list of producer address (port).
+    producer_ports: std.ArrayList(u16),
+    producer_streams: std.ArrayList(net.Stream),
+    producer_streams_state: std.ArrayList(u8),
+
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init() !Self {
         const address = try net.Address.parseIp4("127.0.0.1", ADMIN_PORT);
@@ -41,6 +23,10 @@ pub const KAdmin = struct {
             .admin_address = address,
             .read_buffer = undefined,
             .write_buffer = undefined,
+            // Producer storage init
+            .producer_ports = try std.ArrayList(u16).initCapacity(std.heap.page_allocator, 10),
+            .producer_streams = try std.ArrayList(net.Stream).initCapacity(std.heap.page_allocator, 10),
+            .producer_streams_state = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 10),
         };
     }
 
@@ -49,42 +35,73 @@ pub const KAdmin = struct {
         // Create a server on the address and wait for a connection
         var server = try self.admin_address.listen(.{ .reuse_address = true }); // TCP server
         const connection = try server.accept(); // Block until got a connection
-        defer server.stream.close(); // Close the stream after
 
         // Init the read/write stream.
         var stream_rd = connection.stream.reader(&self.read_buffer);
         var stream_wr = connection.stream.writer(&self.write_buffer);
 
         // Read and process message
-        if (try readFromStream(&stream_rd)) |message| {
-            const parsed_message = self.parseAdminMessage(message);
-            if (parsed_message) |m| {
-                if (try self.processAdminMessage(m)) |response_message| {
-                    try writeToStream(&stream_wr, response_message);
-                }
-            } else {}
+        if (try message_util.readMessageFromStream(&stream_rd)) |message| {
+            if (try self.processMessage(message)) |response_message| {
+                try message_util.writeMessageToStream(&stream_wr, response_message);
+            }
         }
+
+        server.stream.close(); // Close the stream after
     }
 
-    /// Parse message into formatted Message
-    fn parseAdminMessage(_: *Self, message: []u8) ?Message {
-        switch (message[0]) {
-            @intFromEnum(MessageType.ECHO) => {
-                // Remove the first byte (it's type anyway)
-                return Message{ .ECHO = message[1..] };
+    /// Read from a connected producer at index.
+    pub fn readFromProducer(self: *Self, index: usize) !void {
+        // Don't have to read if it's already reading or closed previously.
+        if (self.producer_streams_state.items[index] != 0) {
+            return;
+        }
+        self.producer_streams_state.items[index] = 1;
+        // Use the registered stream.
+        var stream_read_buff: [1024]u8 = undefined;
+        var stream_write_buff: [1024]u8 = undefined;
+        var stream_rd = self.producer_streams.items[index].reader(&stream_read_buff);
+        var stream_wr = self.producer_streams.items[index].writer(&stream_write_buff);
+        // Read from the stream: Blocking until the stream is closed.
+        while (true) {
+            const read_result = message_util.readMessageFromStream(&stream_rd) catch |err| {
+                switch (err) {
+                    error.EndOfStream => {
+                        // Producer closed the stream, no need to read again.
+                        break;
+                    },
+                    else => {
+                        return err;
+                    },
+                }
+            };
+            if (read_result) |message| {
+                if (try self.processMessage(message)) |response_message| {
+                    try message_util.writeMessageToStream(&stream_wr, response_message);
+                }
+            }
+        }
+        std.debug.print("Producer on port {} is gone\n", .{self.producer_ports.items[index]});
+    }
+
+    /// Parse a message and call the correct processing function
+    fn processMessage(self: *Self, message: message_util.Message) !?message_util.Message {
+        switch (message) {
+            message_util.MessageType.ECHO => |echo_message| {
+                const response_data = try self.processEchoMessage(echo_message);
+                return message_util.Message{
+                    .R_ECHO = response_data,
+                };
+            },
+            message_util.MessageType.P_REG => |producer_register_message| {
+                const response = try self.processProducerRegisterMessage(producer_register_message);
+                return message_util.Message{
+                    .R_P_REG = response,
+                };
             },
             else => {
-                // Do nothing here
+                // TODO: Process another message.
                 return null;
-            },
-        }
-    }
-
-    /// Parse a message sent to the admin process and call the correct processing function
-    fn processAdminMessage(self: *Self, message: Message) !?[]u8 {
-        switch (message) {
-            MessageType.ECHO => |echo_message| {
-                return try self.processEchoMessage(echo_message);
             },
         }
     }
@@ -92,5 +109,20 @@ pub const KAdmin = struct {
     fn processEchoMessage(_: *Self, message: []u8) ![]u8 {
         const return_data = try std.fmt.allocPrint(std.heap.page_allocator, "I have received: {s}", .{message});
         return return_data;
+    }
+
+    fn processProducerRegisterMessage(self: *Self, port_str: []u8) !u8 {
+        // Parsing the port
+        const port_int = try std.fmt.parseInt(u16, port_str, 10);
+        // Connect to the server and add a stream to the list:
+        const address = try net.Address.parseIp4("127.0.0.1", port_int);
+        const stream = try net.tcpConnectToAddress(address);
+        // Put into a list of producer
+        try self.producer_ports.append(std.heap.page_allocator, port_int);
+        try self.producer_streams.append(std.heap.page_allocator, stream);
+        try self.producer_streams_state.append(std.heap.page_allocator, 0);
+        // Debug print the list of registered producer:
+        std.debug.print("Registered a producer, list of producer: {any}\n", .{self.producer_ports.items});
+        return 0;
     }
 };
