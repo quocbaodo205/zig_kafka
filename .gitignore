@@ -1,2 +1,3 @@
-zig-cache/
+.*
+!/.gitignore
 zig-out/

@@ -1,18 +1,89 @@
 const std = @import("std");
-const zig_kafka = @import("zig_kafka");
 const net = std.net;
+const kadmin = @import("admin.zig");
 
 pub fn main() !void {
     if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "server")) {
-        try startServer();
+        var admin = try kadmin.KAdmin.init();
+        try admin.startAdminServer();
+        // try spawnServer();
     } else {
-        try clientConnectTCP();
+        const port_str = std.mem.span(std.os.argv[2]); // 2nd argument is the port
+        const port_int = try std.fmt.parseInt(u16, port_str, 10);
+        // try clientConnectTCP(port_int);
+        try clientConnectTCPAndEcho(port_int);
     }
 }
 
-// TODO: Study how to make unix socket works. Currently only IPAddress with tcp protocol works.
-pub fn startServer() !void {
-    const address = try net.Address.parseIp4("127.0.0.1", 1234);
+pub fn writeEchoToStream(stream_wr: *net.Stream.Writer, data: []u8) !void {
+    try stream_wr.interface.writeByte(@intCast(data.len + 1)); // Send how many byte written
+    try stream_wr.interface.writeByte(1); // Send echo command
+    try stream_wr.interface.writeAll(data);
+    try stream_wr.interface.flush();
+}
+
+/// Test echo function
+pub fn clientConnectTCPAndEcho(port: u16) !void {
+    const address = try net.Address.parseIp4("127.0.0.1", port);
+    var stream = try net.tcpConnectToAddress(address);
+    // Read input from stdin and write to stream.
+    var stdin_buf: [1024]u8 = undefined;
+    var rd = std.fs.File.stdin().reader(&stdin_buf);
+    var stream_read_buff: [1024]u8 = undefined;
+    var stream_write_buff: [1024]u8 = undefined;
+    var stream_rd = stream.reader(&stream_read_buff);
+    var stream_wr = stream.writer(&stream_write_buff);
+    while (try readLineFromStdin(&rd)) |line| {
+        std.debug.print("Sent to server and echo command: {s}\n", .{line});
+        try writeEchoToStream(&stream_wr, line);
+        // Try to read back from the stream
+        if (try readFromStream(&stream_rd)) |data| {
+            std.debug.print("Received from server: {s}\n", .{data});
+        }
+    }
+}
+
+pub fn readLineFromStdin(stdin_rd: *std.fs.File.Reader) !?[]u8 {
+    const line = stdin_rd.interface.takeSentinel('\n') catch |err| {
+        switch (err) {
+            error.EndOfStream => {
+                // EOF done, nothing to do.
+                return null;
+            },
+            else => {
+                return err;
+            },
+        }
+    };
+    return line;
+}
+
+pub fn readFromStream(stream_rd: *net.Stream.Reader) !?[]u8 {
+    const header = try stream_rd.file_reader.interface.takeByte();
+    if (header != 0) {
+        const data = try stream_rd.file_reader.interface.take(header);
+        return data;
+    } else {
+        return null;
+    }
+}
+
+pub fn writeToStream(stream_wr: *net.Stream.Writer, data: []u8) !void {
+    try stream_wr.interface.writeByte(@intCast(data.len)); // Send how many byte written
+    try stream_wr.interface.writeAll(data);
+    try stream_wr.interface.flush();
+}
+
+pub fn spawnServer() !void {
+    const thread_1 = try std.Thread.spawn(.{}, startServer, .{@as(u16, 10001)});
+    const thread_2 = try std.Thread.spawn(.{}, startServer, .{@as(u16, 10002)});
+    std.Thread.join(thread_1);
+    std.Thread.join(thread_2);
+}
+
+pub fn startServer(port: u16) !void {
+    std.debug.print("Start server on port {}\n", .{port});
+    const address = try net.Address.parseIp4("127.0.0.1", port);
     var server = try address.listen(.{ .reuse_address = true }); // TCP server
     const connection = try server.accept(); // Accept a connection
     // Read data from the client and output
@@ -22,26 +93,22 @@ pub fn startServer() !void {
     var stream_rd = connection.stream.reader(&stream_read_buff);
     var stream_wr = connection.stream.writer(&stream_write_buff);
     while (true) {
-        const header = try stream_rd.file_reader.interface.takeByte(); // TODO: End of stream error handling
-        if (header != 0) {
-            const data = try stream_rd.file_reader.interface.take(header);
-            std.debug.print("Receive message from client: {s}\n", .{data});
+        if (try readFromStream(&stream_rd)) |data| {
+            std.debug.print("Receive message from client port = {}: {s}\n", .{ port, data });
             if (std.mem.eql(u8, data, "bye")) {
                 // Allow exit on bye
                 break;
             }
-            const sent_data = try std.fmt.allocPrint(std.heap.page_allocator, "I have received: {s}", .{data});
             // Send back to the client: I have seen it
-            try stream_wr.interface.writeByte(@intCast(sent_data.len)); // Send how many byte written
-            try stream_wr.interface.writeAll(sent_data);
-            try stream_wr.interface.flush();
+            const sent_data = try std.fmt.allocPrint(std.heap.page_allocator, "I have received: {s}", .{data});
+            try writeToStream(&stream_wr, sent_data);
         }
     }
     defer server.stream.close();
 }
 
-pub fn clientConnectTCP() !void {
-    const address = try net.Address.parseIp4("127.0.0.1", 1234);
+pub fn clientConnectTCP(port: u16) !void {
+    const address = try net.Address.parseIp4("127.0.0.1", port);
     var stream = try net.tcpConnectToAddress(address);
     // Read input from stdin and write to stream.
     var stdin_buf: [1024]u8 = undefined;
@@ -50,39 +117,15 @@ pub fn clientConnectTCP() !void {
     var stream_write_buff: [1024]u8 = undefined;
     var stream_rd = stream.reader(&stream_read_buff);
     var stream_wr = stream.writer(&stream_write_buff);
-    // Using take delim: https://github.com/ziglang/zig/issues/25597#issuecomment-3410445340
-    while (try rd.interface.takeDelimiter('\n')) |line| {
+    while (try readLineFromStdin(&rd)) |line| {
         std.debug.print("Sent to server: {s}\n", .{line});
-        try stream_wr.interface.writeByte(@intCast(line.len));
-        try stream_wr.interface.writeAll(line);
-        try stream_wr.interface.flush();
+        try writeToStream(&stream_wr, line);
         if (std.mem.eql(u8, line, "bye")) {
             return;
         }
         // Try to read back from the stream
-        const header = try stream_rd.file_reader.interface.takeByte(); // TODO: End of stream error handling
-        if (header != 0) {
-            const data = try stream_rd.file_reader.interface.take(header);
+        if (try readFromStream(&stream_rd)) |data| {
             std.debug.print("Received from server: {s}\n", .{data});
         }
     }
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
 }
