@@ -1,6 +1,8 @@
 const std = @import("std");
 const net = std.net;
 const message_util = @import("message.zig");
+const cgroup = @import("cgroup.zig");
+const topic = @import("topic.zig");
 
 const ADMIN_PORT: u16 = 10000;
 
@@ -10,6 +12,9 @@ pub const KAdmin = struct {
     admin_address: net.Address,
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
+
+    // A list of topic that the admin keeps track
+    topics: std.ArrayList(topic.Topic),
 
     // A list of producer address (port).
     producer_ports: std.ArrayList(u16),
@@ -24,6 +29,8 @@ pub const KAdmin = struct {
             .admin_address = address,
             .read_buffer = undefined,
             .write_buffer = undefined,
+            // Topics
+            .topics = try std.ArrayList(topic.Topic).initCapacity(std.heap.page_allocator, 10),
             // Producer storage init
             .producer_ports = try std.ArrayList(u16).initCapacity(std.heap.page_allocator, 10),
             .producer_streams = try std.ArrayList(net.Stream).initCapacity(std.heap.page_allocator, 10),
@@ -101,6 +108,12 @@ pub const KAdmin = struct {
                     .R_P_REG = response,
                 };
             },
+            message_util.MessageType.C_REG => |consumer_register_message| {
+                const response = try self.processConsumerRegisterMessage(&consumer_register_message);
+                return message_util.Message{
+                    .R_C_REG = response,
+                };
+            },
             else => {
                 // TODO: Process another message.
                 return null;
@@ -114,7 +127,6 @@ pub const KAdmin = struct {
     }
 
     fn processProducerRegisterMessage(self: *Self, rm: *const message_util.ProducerRegisterMessage) !u8 {
-        // Parsing the port
         // Connect to the server and add a stream to the list:
         const address = try net.Address.parseIp4("127.0.0.1", rm.port);
         const stream = try net.tcpConnectToAddress(address);
@@ -123,8 +135,59 @@ pub const KAdmin = struct {
         try self.producer_streams.append(std.heap.page_allocator, stream);
         try self.producer_streams_state.append(std.heap.page_allocator, 0);
         try self.producer_topics.append(std.heap.page_allocator, rm.topic);
+        // Add the topic if not exist
+        var topic_exist = false;
+        for (self.topics.items) |tp| {
+            if (tp.topic_id == rm.topic) {
+                topic_exist = true;
+                break;
+            }
+        }
+        if (!topic_exist) {
+            const new_topic = try topic.Topic.new(rm.topic);
+            try self.topics.append(
+                std.heap.page_allocator,
+                new_topic,
+            );
+        }
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer, list of producer: {any}\n", .{self.producer_ports.items});
+        return 0;
+    }
+
+    fn processConsumerRegisterMessage(self: *Self, rm: *const message_util.ConsumerRegisterMessage) !u8 {
+        // Check if topic exist
+        var exist = false;
+        var topic_pos: usize = 0;
+        for (self.topics.items, 0..) |tp, i| {
+            if (tp.topic_id == rm.topic) {
+                topic_pos = i;
+                exist = true;
+                break;
+            }
+        }
+        if (!exist) {
+            return 1; // We only accept known topic.
+        }
+        // Connect to the server
+        const address = try net.Address.parseIp4("127.0.0.1", rm.port);
+        const stream = try net.tcpConnectToAddress(address);
+        // Add this data to the correct consumer group.
+        // Check if consumer group with this ID exist, add if not
+        exist = false;
+        for (self.topics.items[topic_pos].cgroups.items) |cg| {
+            if (cg.group_id == rm.group_id) {
+                exist = true;
+                break;
+            }
+        }
+        if (!exist) {
+            const new_group = try cgroup.CGroup.new(rm.group_id, rm.topic);
+            try self.topics.items[topic_pos].addCGroup(&new_group);
+        }
+        // Add the port, stream and stream_state
+        try self.topics.items[topic_pos].addConsumer(rm.port, stream, rm.group_id);
+        std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ rm.port, rm.topic, rm.group_id });
         return 0;
     }
 };

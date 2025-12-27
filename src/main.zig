@@ -3,8 +3,9 @@ const net = std.net;
 const kadmin = @import("admin.zig");
 const message_util = @import("message.zig");
 const producer = @import("producer.zig");
+const consumer = @import("consumer.zig");
 
-fn startProducer(admin: *kadmin.KAdmin, pos: usize) !void {
+fn readProducer(admin: *kadmin.KAdmin, pos: usize) !void {
     try admin.readFromProducer(pos);
 }
 
@@ -12,12 +13,13 @@ pub fn initKAdmin() !void {
     var admin = try kadmin.KAdmin.init();
     while (true) {
         try admin.startAdminServer();
+        // Start all producer processes
         for (admin.producer_streams_state.items, 0..) |state, i| {
             if (state != 0) {
                 continue;
             }
             // Spawn a thread to read from it.
-            const thread_1 = try std.Thread.spawn(.{}, startProducer, .{ @as(*kadmin.KAdmin, &admin), @as(usize, i) });
+            const thread_1 = try std.Thread.spawn(.{}, readProducer, .{ @as(*kadmin.KAdmin, &admin), @as(usize, i) });
             // TODO: Join it somewhere, but it's still auto clean up upon end of stream.
             _ = thread_1;
         }
@@ -40,11 +42,22 @@ pub fn initProducer() !void {
     p.close();
 }
 
+pub fn initConsumer() !void {
+    const port = try std.fmt.parseInt(u16, std.mem.span(std.os.argv[2]), 10); // 2nd argument is the port
+    const topic = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[3]), 10); // 3rd argument is the topic
+    const group = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[4]), 10); // 4th argument is the topic
+    var c = try consumer.Consumer.init(port, topic, group);
+    try c.startConsumerServer();
+    // For now, immediately close it
+}
+
 pub fn main() !void {
     if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "server")) {
         try initKAdmin();
     } else if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "producer")) {
         try initProducer();
+    } else if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "consumer")) {
+        try initConsumer();
     } else {
         // TODO: Init other type of process
     }
