@@ -7,6 +7,7 @@ const ADMIN_PORT: u16 = 10000;
 pub const Producer = struct {
     const Self = @This();
 
+    topic: u32,
     port: u16,
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
@@ -15,8 +16,9 @@ pub const Producer = struct {
     server: net.Server,
     connection: net.Server.Connection,
 
-    pub fn init(port: u16) !Self {
+    pub fn init(port: u16, topic: u32) !Self {
         return Self{
+            .topic = topic,
             .port = port,
             .read_buffer = undefined,
             .write_buffer = undefined,
@@ -33,10 +35,12 @@ pub const Producer = struct {
         // Send register message to kadmin
         var stream_rd = stream.reader(&self.read_buffer);
         var stream_wr = stream.writer(&self.write_buffer);
-        const port_str = try std.fmt.allocPrint(std.heap.page_allocator, "{}", .{self.port});
-        std.debug.print("Sent to server the port: {s}\n", .{port_str});
+        std.debug.print("Sent to server the port: {}, topic: {}\n", .{ self.port, self.topic });
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-            .P_REG = port_str,
+            .P_REG = message_util.ProducerRegisterMessage{
+                .topic = self.topic,
+                .port = self.port,
+            },
         });
         // Try to read back the response from kadmin
         if (try message_util.readMessageFromStream(&stream_rd)) |res| {

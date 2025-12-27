@@ -10,9 +10,33 @@ pub const MessageType = enum(u8) {
     R_P_REG = 102,
 };
 
+pub const ProducerRegisterMessage = struct {
+    topic: u32,
+    port: u16,
+
+    const Self = @This();
+
+    pub fn new(data: []u8) Self {
+        // First 4 bytes is the topic
+        const topic: u32 = std.mem.readInt(u32, data[0..4], .big);
+        // Next 2 bytes is the port
+        const port: u16 = std.mem.readInt(u16, data[4..6], .big);
+        return ProducerRegisterMessage{
+            .topic = topic,
+            .port = port,
+        };
+    }
+
+    pub fn convertToBytes(self: *const Self, buffer: []u8) ![]u8 {
+        std.mem.writeInt(u32, buffer[0..4], self.topic, .big);
+        std.mem.writeInt(u16, buffer[4..6], self.port, .big);
+        return buffer[0..6];
+    }
+};
+
 pub const Message = union(MessageType) {
     ECHO: []u8,
-    P_REG: []u8, // A string contain the port number
+    P_REG: ProducerRegisterMessage, // A string contain the port number
     R_ECHO: []u8, // Echo back the message
     R_P_REG: u8, // Just return a number as ack
 };
@@ -26,7 +50,7 @@ fn parseMessage(message: []u8) ?Message {
             return Message{ .R_ECHO = message[1..] };
         },
         @intFromEnum(MessageType.P_REG) => {
-            return Message{ .P_REG = message[1..] };
+            return Message{ .P_REG = ProducerRegisterMessage.new(message[1..]) };
         },
         @intFromEnum(MessageType.R_P_REG) => {
             return Message{ .R_P_REG = message[1] };
@@ -71,8 +95,9 @@ pub fn writeMessageToStream(stream_wr: *net.Stream.Writer, message: Message) !vo
         MessageType.ECHO => |data| {
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.ECHO), data);
         },
-        MessageType.P_REG => |data| {
-            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.P_REG), data);
+        MessageType.P_REG => |rm| {
+            var buf: [1024]u8 = undefined;
+            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.P_REG), try rm.convertToBytes(&buf));
         },
         MessageType.R_ECHO => |data| {
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_ECHO), data);

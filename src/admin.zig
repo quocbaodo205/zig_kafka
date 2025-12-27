@@ -15,6 +15,7 @@ pub const KAdmin = struct {
     producer_ports: std.ArrayList(u16),
     producer_streams: std.ArrayList(net.Stream),
     producer_streams_state: std.ArrayList(u8),
+    producer_topics: std.ArrayList(u32),
 
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init() !Self {
@@ -27,6 +28,7 @@ pub const KAdmin = struct {
             .producer_ports = try std.ArrayList(u16).initCapacity(std.heap.page_allocator, 10),
             .producer_streams = try std.ArrayList(net.Stream).initCapacity(std.heap.page_allocator, 10),
             .producer_streams_state = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 10),
+            .producer_topics = try std.ArrayList(u32).initCapacity(std.heap.page_allocator, 10),
         };
     }
 
@@ -94,7 +96,7 @@ pub const KAdmin = struct {
                 };
             },
             message_util.MessageType.P_REG => |producer_register_message| {
-                const response = try self.processProducerRegisterMessage(producer_register_message);
+                const response = try self.processProducerRegisterMessage(&producer_register_message);
                 return message_util.Message{
                     .R_P_REG = response,
                 };
@@ -111,16 +113,16 @@ pub const KAdmin = struct {
         return return_data;
     }
 
-    fn processProducerRegisterMessage(self: *Self, port_str: []u8) !u8 {
+    fn processProducerRegisterMessage(self: *Self, rm: *const message_util.ProducerRegisterMessage) !u8 {
         // Parsing the port
-        const port_int = try std.fmt.parseInt(u16, port_str, 10);
         // Connect to the server and add a stream to the list:
-        const address = try net.Address.parseIp4("127.0.0.1", port_int);
+        const address = try net.Address.parseIp4("127.0.0.1", rm.port);
         const stream = try net.tcpConnectToAddress(address);
         // Put into a list of producer
-        try self.producer_ports.append(std.heap.page_allocator, port_int);
+        try self.producer_ports.append(std.heap.page_allocator, rm.port);
         try self.producer_streams.append(std.heap.page_allocator, stream);
         try self.producer_streams_state.append(std.heap.page_allocator, 0);
+        try self.producer_topics.append(std.heap.page_allocator, rm.topic);
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer, list of producer: {any}\n", .{self.producer_ports.items});
         return 0;

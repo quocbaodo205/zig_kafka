@@ -27,7 +27,9 @@ pub fn initKAdmin() !void {
 pub fn initProducer() !void {
     const port_str = std.mem.span(std.os.argv[2]); // 2nd argument is the port
     const port_int = try std.fmt.parseInt(u16, port_str, 10);
-    var p = try producer.Producer.init(port_int);
+    const topic_str = std.mem.span(std.os.argv[3]); // 3rd argument is the topic
+    const topic_int = try std.fmt.parseInt(u32, topic_str, 10);
+    var p = try producer.Producer.init(port_int, topic_int);
     try p.startProducerServer();
     // Read input from stdin and write to the producer.
     var stdin_buf: [1024]u8 = undefined;
