@@ -77,6 +77,27 @@ pub const Producer = struct {
         }
     }
 
+    /// Write the input message to the stream in the correct PCM format
+    pub fn writeMessage(self: *Self, message: []u8) !void {
+        // Create timestamp
+        const ts: u64 = @intCast(std.time.timestamp());
+        // Init the read/write stream.
+        var stream_rd = self.connection.stream.reader(&self.read_buffer);
+        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        // Write echo message
+        try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+            .PCM = message_util.ProduceConsumeMessage{
+                .message = message,
+                .producer_port = self.port,
+                .timestamp = ts,
+            },
+        });
+        // Read back response echo message
+        if (try message_util.readMessageFromStream(&stream_rd)) |m| {
+            std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});
+        }
+    }
+
     pub fn close(self: *Self) void {
         self.server.stream.close();
     }

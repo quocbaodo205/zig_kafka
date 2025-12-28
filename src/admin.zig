@@ -6,6 +6,18 @@ const topic = @import("topic.zig");
 
 const ADMIN_PORT: u16 = 10000;
 
+/// Run this forever, so prefer to be in a thread.
+pub fn advanceTopic(tp: *topic.Topic) !void {
+    if (tp.is_advancing) {
+        return;
+    }
+    std.debug.print("Start advancing... \n", .{});
+    tp.is_advancing = true;
+    while (true) {
+        try tp.advanceAllConsumerGroupBlocking();
+    }
+}
+
 pub const KAdmin = struct {
     const Self = @This();
 
@@ -51,7 +63,7 @@ pub const KAdmin = struct {
 
         // Read and process message
         if (try message_util.readMessageFromStream(&stream_rd)) |message| {
-            if (try self.processMessage(message)) |response_message| {
+            if (try self.processAdminMessage(message)) |response_message| {
                 try message_util.writeMessageToStream(&stream_wr, response_message);
             }
         }
@@ -85,7 +97,7 @@ pub const KAdmin = struct {
                 }
             };
             if (read_result) |message| {
-                if (try self.processMessage(message)) |response_message| {
+                if (try self.processProducerMessage(message, index)) |response_message| {
                     try message_util.writeMessageToStream(&stream_wr, response_message);
                 }
             }
@@ -93,8 +105,23 @@ pub const KAdmin = struct {
         std.debug.print("Producer on port {} is gone\n", .{self.producer_ports.items[index]});
     }
 
+    fn processProducerMessage(self: *Self, message: message_util.Message, producer_pos: usize) !?message_util.Message {
+        switch (message) {
+            message_util.MessageType.PCM => |pcm| {
+                const response = try self.processPCM(&pcm, producer_pos);
+                return message_util.Message{
+                    .R_PCM = response,
+                };
+            },
+            else => {
+                // TODO: Process another message.
+                return null;
+            },
+        }
+    }
+
     /// Parse a message and call the correct processing function
-    fn processMessage(self: *Self, message: message_util.Message) !?message_util.Message {
+    fn processAdminMessage(self: *Self, message: message_util.Message) !?message_util.Message {
         switch (message) {
             message_util.MessageType.ECHO => |echo_message| {
                 const response_data = try self.processEchoMessage(echo_message);
@@ -187,7 +214,25 @@ pub const KAdmin = struct {
         }
         // Add the port, stream and stream_state
         try self.topics.items[topic_pos].addConsumer(rm.port, stream, rm.group_id);
-        std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ rm.port, rm.topic, rm.group_id });
+        // After start, can start advancing right away:
+        const t = try std.Thread.spawn(.{}, advanceTopic, .{@as(*topic.Topic, &self.topics.items[topic_pos])});
+        _ = t;
         return 0;
+    }
+
+    fn processPCM(self: *Self, pcm: *const message_util.ProduceConsumeMessage, producer_pos: usize) !u8 {
+        // Send this message to the correct topic
+        for (self.topics.items) |*tp| {
+            if (tp.topic_id == self.producer_topics.items[producer_pos]) {
+                var copyData = try std.heap.page_allocator.create(message_util.ProduceConsumeMessage);
+                copyData.producer_port = pcm.producer_port;
+                copyData.timestamp = pcm.timestamp;
+                copyData.message = try std.heap.page_allocator.alloc(u8, pcm.message.len);
+                @memcpy(copyData.message, pcm.message);
+                tp.addMessage(copyData);
+                return 0;
+            }
+        }
+        return 1; // Cannot find the topic!
     }
 };

@@ -66,6 +66,22 @@ pub const Consumer = struct {
         // Later, we can use the self.connection to read / write message.
     }
 
+    /// Block until we received a PCM message.
+    pub fn receiveMessage(self: *Self) !void {
+        // Init the read/write stream.
+        var stream_rd = self.connection.stream.reader(&self.read_buffer);
+        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        // Read PCM message
+        if (try message_util.readMessageFromStream(&stream_rd)) |message| {
+            // Debug print
+            std.debug.print("Receive message {s} from producer {} at ts = {}\n", .{ message.PCM.message, message.PCM.producer_port, message.PCM.timestamp });
+            // Write response message
+            try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+                .R_PCM = 0,
+            });
+        }
+    }
+
     pub fn close(self: *Self) void {
         self.server.stream.close();
     }

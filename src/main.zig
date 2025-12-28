@@ -9,8 +9,23 @@ fn readProducer(admin: *kadmin.KAdmin, pos: usize) !void {
     try admin.readFromProducer(pos);
 }
 
+/// Run forever to advance all topic in the admin
+fn advanceAllTopic(admin: *kadmin.KAdmin) !void {
+    while (true) {
+        if (admin.topics.items.len == 0) {
+            continue;
+        }
+        for (admin.topics.items) |*tp| {
+            try tp.advanceAllConsumerGroupBlocking();
+        }
+    }
+}
+
 pub fn initKAdmin() !void {
     var admin = try kadmin.KAdmin.init();
+    // const thread_topic = try std.Thread.spawn(.{}, advanceAllTopic, .{@as(*kadmin.KAdmin, &admin)});
+    // // TODO: Join it somewhere...
+    // _ = thread_topic;
     while (true) {
         try admin.startAdminServer();
         // Start all producer processes
@@ -37,7 +52,7 @@ pub fn initProducer() !void {
     var stdin_buf: [1024]u8 = undefined;
     var rd = std.fs.File.stdin().reader(&stdin_buf);
     while (try readLineFromStdin(&rd)) |line| {
-        try p.writeTestMessage(line);
+        try p.writeMessage(line);
     }
     p.close();
 }
@@ -48,7 +63,11 @@ pub fn initConsumer() !void {
     const group = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[4]), 10); // 4th argument is the topic
     var c = try consumer.Consumer.init(port, topic, group);
     try c.startConsumerServer();
-    // For now, immediately close it
+    // Always try to receive message
+    while (true) {
+        try c.receiveMessage();
+    }
+    c.close();
 }
 
 pub fn main() !void {

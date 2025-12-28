@@ -6,10 +6,12 @@ pub const MessageType = enum(u8) {
     ECHO = 1,
     P_REG = 2, // Register a producer
     C_REG = 3, // Register a consumer
+    PCM = 4, // A message from producer that needs to be sent to consumer.
     // Return message start at 100
     R_ECHO = 101,
     R_P_REG = 102,
     R_C_REG = 103,
+    R_PCM = 104,
 };
 
 pub const ProducerRegisterMessage = struct {
@@ -66,13 +68,45 @@ pub const ConsumerRegisterMessage = struct {
     }
 };
 
+pub const ProduceConsumeMessage = struct {
+    producer_port: u16,
+    timestamp: u64,
+    message: []u8,
+
+    const Self = @This();
+
+    /// Convert from a bytes message
+    pub fn new(data: []u8) Self {
+        // First 2 bytes is the producer port
+        const producer_port: u16 = std.mem.readInt(u16, data[0..2], .big);
+        // Next 8 bytes is the timestamp in u64
+        const ts: u64 = std.mem.readInt(u64, data[2..10], .big);
+        // The rest is the message in []u8
+        return ProduceConsumeMessage{
+            .producer_port = producer_port,
+            .timestamp = ts,
+            .message = data[10..],
+        };
+    }
+
+    pub fn convertToBytes(self: *const Self, buffer: []u8) ![]u8 {
+        std.mem.writeInt(u16, buffer[0..2], self.producer_port, .big);
+        std.mem.writeInt(u64, buffer[2..10], self.timestamp, .big);
+        const message_len = self.message.len;
+        @memcpy(buffer[10 .. 10 + message_len], self.message);
+        return buffer[0 .. 10 + message_len];
+    }
+};
+
 pub const Message = union(MessageType) {
     ECHO: []u8,
     P_REG: ProducerRegisterMessage,
     C_REG: ConsumerRegisterMessage,
+    PCM: ProduceConsumeMessage,
     R_ECHO: []u8, // Echo back the message
     R_P_REG: u8, // Just return a number as ack
     R_C_REG: u8, // Just return a number as ack
+    R_PCM: u8, // Just return a number as ack upon sent / receive
 };
 
 fn parseMessage(message: []u8) ?Message {
@@ -94,6 +128,12 @@ fn parseMessage(message: []u8) ?Message {
         },
         @intFromEnum(MessageType.R_C_REG) => {
             return Message{ .R_C_REG = message[1] };
+        },
+        @intFromEnum(MessageType.PCM) => {
+            return Message{ .PCM = ProduceConsumeMessage.new(message[1..]) };
+        },
+        @intFromEnum(MessageType.R_PCM) => {
+            return Message{ .R_PCM = message[1] };
         },
         else => {
             // Do nothing here
@@ -153,6 +193,14 @@ pub fn writeMessageToStream(stream_wr: *net.Stream.Writer, message: Message) !vo
         MessageType.R_C_REG => |ack_byte| {
             var data: [1]u8 = [1]u8{ack_byte};
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_C_REG), &data);
+        },
+        MessageType.PCM => |pcm| {
+            var buf: [1024]u8 = undefined;
+            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.PCM), try pcm.convertToBytes(&buf));
+        },
+        MessageType.R_PCM => |ack_byte| {
+            var data: [1]u8 = [1]u8{ack_byte};
+            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_PCM), &data);
         },
     }
 }
