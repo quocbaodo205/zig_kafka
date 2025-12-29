@@ -9,6 +9,7 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
         l: usize,
         r: usize,
         len: usize,
+        pop_num: usize,
 
         const Self = @This();
 
@@ -19,6 +20,7 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
                 .l = 0,
                 .r = 0,
                 .len = 0,
+                .pop_num = 0,
             };
         }
 
@@ -56,6 +58,7 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
             self.arr[self.l] = null;
             self.len -= 1;
             self.l += 1;
+            self.pop_num += 1;
             if (self.l >= max_n) {
                 self.l = 0;
             }
@@ -64,10 +67,11 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
 
         /// Peek a position from the start
         pub fn peek(self: *const Self, pos: usize) ?T {
-            if (pos >= self.len) {
+            const true_pos = pos - self.pop_num;
+            if (true_pos >= self.len) {
                 return null;
             }
-            return self.arr[(self.l + pos) % max_n];
+            return self.arr[(self.l + true_pos) % max_n];
         }
     };
 }

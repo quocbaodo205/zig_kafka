@@ -6,18 +6,6 @@ const topic = @import("topic.zig");
 
 const ADMIN_PORT: u16 = 10000;
 
-/// Run this forever, so prefer to be in a thread.
-pub fn advanceTopic(tp: *topic.Topic) !void {
-    if (tp.is_advancing) {
-        return;
-    }
-    std.debug.print("Start advancing... \n", .{});
-    tp.is_advancing = true;
-    while (true) {
-        try tp.advanceAllConsumerGroupBlocking();
-    }
-}
-
 pub const KAdmin = struct {
     const Self = @This();
 
@@ -27,12 +15,14 @@ pub const KAdmin = struct {
 
     // A list of topic that the admin keeps track
     topics: std.ArrayList(topic.Topic),
+    topic_threads: std.ArrayList(std.Thread),
 
-    // A list of producer address (port).
+    // A list of producer.
     producer_ports: std.ArrayList(u16),
     producer_streams: std.ArrayList(net.Stream),
     producer_streams_state: std.ArrayList(u8),
     producer_topics: std.ArrayList(u32),
+    producer_threads: std.ArrayList(std.Thread),
 
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init() !Self {
@@ -48,6 +38,8 @@ pub const KAdmin = struct {
             .producer_streams = try std.ArrayList(net.Stream).initCapacity(std.heap.page_allocator, 10),
             .producer_streams_state = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 10),
             .producer_topics = try std.ArrayList(u32).initCapacity(std.heap.page_allocator, 10),
+            .producer_threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, 10),
+            .topic_threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, 10),
         };
     }
 
@@ -71,12 +63,48 @@ pub const KAdmin = struct {
         server.stream.close(); // Close the stream after
     }
 
+    pub fn closeAdminServer(self: *Self) void {
+        self.closeAllProducer();
+        self.closeAllTopic();
+    }
+
+    fn closeAllProducer(self: *Self) void {
+        // Close all open producer stream
+        for (self.producer_streams_state.items, 0..) |st, i| {
+            if (st == 0) {
+                self.producer_streams.items[i].close();
+            }
+        }
+        // Join all current open thread.
+        for (self.producer_threads.items) |th| {
+            th.join();
+        }
+    }
+
+    fn closeAllTopic(self: *Self) void {
+        // Close all topic stream
+        for (self.topics.items) |*tp| {
+            for (tp.cgroups.items) |*cg| {
+                for (cg.consumer_streams_state.items, 0..) |st, i| {
+                    if (st == 0) {
+                        cg.consumer_streams.items[i].close();
+                    }
+                }
+            }
+        }
+        // Join all current open thread.
+        for (self.topic_threads.items) |th| {
+            th.join();
+        }
+    }
+
     /// Read from a connected producer at index.
-    pub fn readFromProducer(self: *Self, index: usize) !void {
+    fn readFromProducer(self: *Self, index: usize) !void {
         // Don't have to read if it's already reading or closed previously.
         if (self.producer_streams_state.items[index] != 0) {
             return;
         }
+        std.debug.print("Start reading from producer with port {}\n", .{self.producer_ports.items[index]});
         self.producer_streams_state.items[index] = 1;
         // Use the registered stream.
         var stream_read_buff: [1024]u8 = undefined;
@@ -179,6 +207,9 @@ pub const KAdmin = struct {
         }
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer, list of producer: {any}\n", .{self.producer_ports.items});
+        // Upon register, just start consuming in another thread.
+        const thread = try std.Thread.spawn(.{}, KAdmin.readFromProducer, .{ @as(*Self, self), @as(usize, self.producer_ports.items.len - 1) });
+        try self.producer_threads.append(std.heap.page_allocator, thread);
         return 0;
     }
 
@@ -213,10 +244,13 @@ pub const KAdmin = struct {
             try self.topics.items[topic_pos].addCGroup(&new_group);
         }
         // Add the port, stream and stream_state
-        try self.topics.items[topic_pos].addConsumer(rm.port, stream, rm.group_id);
+        const pos = try self.topics.items[topic_pos].addConsumer(rm.port, stream, rm.group_id);
         // After start, can start advancing right away:
-        const t = try std.Thread.spawn(.{}, advanceTopic, .{@as(*topic.Topic, &self.topics.items[topic_pos])});
-        _ = t;
+        const thread = try std.Thread.spawn(.{}, topic.Topic.advanceConsumerGroup, .{ @as(*topic.Topic, &self.topics.items[topic_pos]), pos });
+        try self.topic_threads.append(std.heap.page_allocator, thread);
+        // Thread to start popping message from the topic queue
+        const pop_thread = try std.Thread.spawn(.{}, topic.Topic.tryPopMessage, .{@as(*topic.Topic, &self.topics.items[topic_pos])});
+        _ = pop_thread; // TODO: join with a way to cancel somehow on exit.
         return 0;
     }
 

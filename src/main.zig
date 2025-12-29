@@ -5,40 +5,12 @@ const message_util = @import("message.zig");
 const producer = @import("producer.zig");
 const consumer = @import("consumer.zig");
 
-fn readProducer(admin: *kadmin.KAdmin, pos: usize) !void {
-    try admin.readFromProducer(pos);
-}
-
-/// Run forever to advance all topic in the admin
-fn advanceAllTopic(admin: *kadmin.KAdmin) !void {
-    while (true) {
-        if (admin.topics.items.len == 0) {
-            continue;
-        }
-        for (admin.topics.items) |*tp| {
-            try tp.advanceAllConsumerGroupBlocking();
-        }
-    }
-}
-
 pub fn initKAdmin() !void {
     var admin = try kadmin.KAdmin.init();
-    // const thread_topic = try std.Thread.spawn(.{}, advanceAllTopic, .{@as(*kadmin.KAdmin, &admin)});
-    // // TODO: Join it somewhere...
-    // _ = thread_topic;
     while (true) {
         try admin.startAdminServer();
-        // Start all producer processes
-        for (admin.producer_streams_state.items, 0..) |state, i| {
-            if (state != 0) {
-                continue;
-            }
-            // Spawn a thread to read from it.
-            const thread_1 = try std.Thread.spawn(.{}, readProducer, .{ @as(*kadmin.KAdmin, &admin), @as(usize, i) });
-            // TODO: Join it somewhere, but it's still auto clean up upon end of stream.
-            _ = thread_1;
-        }
     }
+    defer admin.closeAdminServer();
 }
 
 pub fn initProducer() !void {
