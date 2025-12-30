@@ -7,11 +7,13 @@ pub const MessageType = enum(u8) {
     P_REG = 2, // Register a producer
     C_REG = 3, // Register a consumer
     PCM = 4, // A message from producer that needs to be sent to consumer.
+    C_RD = 5, // A message say that this consumer is ready for receiving message.
     // Return message start at 100
     R_ECHO = 101,
     R_P_REG = 102,
     R_C_REG = 103,
     R_PCM = 104,
+    R_C_RD = 105,
 };
 
 pub const ProducerRegisterMessage = struct {
@@ -103,10 +105,12 @@ pub const Message = union(MessageType) {
     P_REG: ProducerRegisterMessage,
     C_REG: ConsumerRegisterMessage,
     PCM: ProduceConsumeMessage,
+    C_RD: u8, // Just a byte
     R_ECHO: []u8, // Echo back the message
     R_P_REG: u8, // Just return a number as ack
     R_C_REG: u8, // Just return a number as ack
     R_PCM: u8, // Just return a number as ack upon sent / receive
+    R_C_RD: u8, // Just ack
 };
 
 fn parseMessage(message: []u8) ?Message {
@@ -133,6 +137,12 @@ fn parseMessage(message: []u8) ?Message {
             return Message{ .PCM = ProduceConsumeMessage.new(message[1..]) };
         },
         @intFromEnum(MessageType.R_PCM) => {
+            return Message{ .R_PCM = message[1] };
+        },
+        @intFromEnum(MessageType.C_RD) => {
+            return Message{ .C_RD = message[1] };
+        },
+        @intFromEnum(MessageType.R_C_RD) => {
             return Message{ .R_PCM = message[1] };
         },
         else => {
@@ -201,6 +211,14 @@ pub fn writeMessageToStream(stream_wr: *net.Stream.Writer, message: Message) !vo
         MessageType.R_PCM => |ack_byte| {
             var data: [1]u8 = [1]u8{ack_byte};
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_PCM), &data);
+        },
+        MessageType.C_RD => |s| {
+            var buf: [1]u8 = [1]u8{s};
+            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.C_RD), &buf);
+        },
+        MessageType.R_C_RD => |ack_byte| {
+            var data: [1]u8 = [1]u8{ack_byte};
+            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_C_RD), &data);
         },
     }
 }

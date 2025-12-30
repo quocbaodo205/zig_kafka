@@ -39,7 +39,7 @@ pub const Topic = struct {
         std.debug.print("Added a consumer group: port = {}, topic = {} with offset 0\n", .{ cgroup.consumer_ports, self.topic_id });
     }
 
-    /// Add a new consumer to a consumer group with the given group ID and return the cgroup position.
+    /// Add a new consumer to a consumer group with the given group ID and return the consumer position.
     /// Assume exist (check outside not in this function)
     pub fn addConsumer(self: *Self, port: u16, stream: net.Stream, group_id: u32) !usize {
         for (self.cgroups.items, 0..) |*cg, i| {
@@ -48,6 +48,9 @@ pub const Topic = struct {
                 try cg.consumer_ports.append(std.heap.page_allocator, port);
                 try cg.consumer_streams.append(std.heap.page_allocator, stream);
                 try cg.consumer_streams_state.append(std.heap.page_allocator, 0);
+                // Spawn a thread to process ready message right after add.
+                const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ cg, cg.consumer_ports.items.len - 1 });
+                _ = th; // No need to join
                 return i;
             }
         }

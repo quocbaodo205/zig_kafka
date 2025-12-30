@@ -66,6 +66,23 @@ pub const Consumer = struct {
         // Later, we can use the self.connection to read / write message.
     }
 
+    /// Block until the kadmin accept our ready message.
+    pub fn sendReadyMessage(self: *Self) !void {
+        // Init the read/write stream.
+        var stream_rd = self.connection.stream.reader(&self.read_buffer);
+        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        // Send the ready message
+        try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+            .C_RD = 0,
+        });
+        std.debug.print("Sent ready to kadmin for consumer on port {}\n", .{self.port});
+        // Read ACK message
+        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
+            // Debug print
+            std.debug.print("Admin ack the ready\n", .{});
+        }
+    }
+
     /// Block until we received a PCM message.
     pub fn receiveMessage(self: *Self) !void {
         // Init the read/write stream.

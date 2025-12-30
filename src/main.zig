@@ -20,11 +20,10 @@ pub fn initProducer() !void {
     const topic_int = try std.fmt.parseInt(u32, topic_str, 10);
     var p = try producer.Producer.init(port_int, topic_int);
     try p.startProducerServer();
-    // Read input from stdin and write to the producer.
-    var stdin_buf: [1024]u8 = undefined;
-    var rd = std.fs.File.stdin().reader(&stdin_buf);
-    while (try readLineFromStdin(&rd)) |line| {
-        try p.writeMessage(line);
+    // Don't read from stdin anymore! Just run forever!
+    while (true) {
+        std.Thread.sleep(1 * 1000000000);
+        try p.writeMessage(try std.fmt.allocPrint(std.heap.page_allocator, "Ping from {}", .{port_int}));
     }
     p.close();
 }
@@ -33,10 +32,13 @@ pub fn initConsumer() !void {
     const port = try std.fmt.parseInt(u16, std.mem.span(std.os.argv[2]), 10); // 2nd argument is the port
     const topic = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[3]), 10); // 3rd argument is the topic
     const group = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[4]), 10); // 4th argument is the topic
+    const sleep_mili = try std.fmt.parseInt(u64, std.mem.span(std.os.argv[5]), 10); // 5th argument is the sleep time in milli
     var c = try consumer.Consumer.init(port, topic, group);
     try c.startConsumerServer();
     // Always try to receive message
     while (true) {
+        std.Thread.sleep(sleep_mili * 1000 * 1000);
+        try c.sendReadyMessage();
         try c.receiveMessage();
     }
     c.close();
