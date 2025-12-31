@@ -45,14 +45,14 @@ pub const Topic = struct {
         self.mq_lock.unlock(); // Release
     }
 
-    pub fn advanceConsumerGroup(self: *Self, cgroup: *CGroup) !void {
+    pub fn advanceConsumerGroup(self: *Self, io: std.Io, cgroup: *CGroup) !void {
         while (true) {
             const message = self.mq.peek(cgroup.offset);
             if (message == null) {
                 continue;
             }
             // Write message at that offset
-            cgroup.writeMessageToAnyConsumer(message_util.Message{ .PCM = message.? }) catch |err| {
+            cgroup.writeMessageToAnyConsumer(io, message_util.Message{ .PCM = message.? }) catch |err| {
                 return err; // Return here since the error in unrecoverable
             };
             // Advance the offset if good.
@@ -60,7 +60,7 @@ pub const Topic = struct {
         }
     }
 
-    pub fn tryPopMessage(self: *Self) !void {
+    pub fn tryPopMessage(self: *Self, io: std.Io) !void {
         self.topic_lock.lock();
         if (self.is_advancing) {
             self.topic_lock.unlock();
@@ -69,7 +69,7 @@ pub const Topic = struct {
         self.is_advancing = true;
         self.topic_lock.unlock();
         while (true) {
-            std.Thread.sleep(10 * 1000000000); // Every 10s
+            try std.Io.sleep(io, .fromSeconds(10), .awake); // Every 10s
             self.topic_lock.lockShared(); // Need the number of consumer group to be stable
             var min_offset: usize = 1000000000;
             for (self.cgroups.items) |*cg| {

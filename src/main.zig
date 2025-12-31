@@ -1,45 +1,57 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const kadmin = @import("admin.zig");
 const message_util = @import("message.zig");
 const producer = @import("producer.zig");
 const consumer = @import("consumer.zig");
 
 pub fn initKAdmin() !void {
+    // Set up our I/O implementation.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var admin = try kadmin.KAdmin.init();
     while (true) {
-        try admin.startAdminServer();
+        try admin.startAdminServer(io);
     }
     defer admin.closeAdminServer();
 }
 
 pub fn initProducer() !void {
+    // Set up our I/O implementation.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const port_str = std.mem.span(std.os.argv[2]); // 2nd argument is the port
     const port_int = try std.fmt.parseInt(u16, port_str, 10);
     const topic_str = std.mem.span(std.os.argv[3]); // 3rd argument is the topic
     const topic_int = try std.fmt.parseInt(u32, topic_str, 10);
     var p = try producer.ProducerProcess.init(port_int, topic_int);
-    try p.startProducerServer();
+    try p.startProducerServer(io);
     // Don't read from stdin anymore! Just run forever!
     while (true) {
-        std.Thread.sleep(1 * 1000000000);
-        try p.writeMessage(try std.fmt.allocPrint(std.heap.page_allocator, "Ping from {}", .{port_int}));
+        try std.Io.sleep(io, .fromSeconds(1), .awake);
+        try p.writeMessage(io, try std.fmt.allocPrint(std.heap.page_allocator, "Ping from {}", .{port_int}));
     }
     p.close();
 }
 
 pub fn initConsumer() !void {
+    // Set up our I/O implementation.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const port = try std.fmt.parseInt(u16, std.mem.span(std.os.argv[2]), 10); // 2nd argument is the port
     const topic = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[3]), 10); // 3rd argument is the topic
     const group = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[4]), 10); // 4th argument is the topic
-    const sleep_mili = try std.fmt.parseInt(u64, std.mem.span(std.os.argv[5]), 10); // 5th argument is the sleep time in milli
+    const sleep_mili = try std.fmt.parseInt(i64, std.mem.span(std.os.argv[5]), 10); // 5th argument is the sleep time in milli
     var c = try consumer.ConsumerProcess.init(port, topic, group);
-    try c.startConsumerServer();
+    try c.startConsumerServer(io);
     // Always try to receive message
     while (true) {
-        std.Thread.sleep(sleep_mili * 1000 * 1000);
-        try c.sendReadyMessage();
-        try c.receiveMessage();
+        try std.Io.sleep(io, .fromMilliseconds(sleep_mili), .awake);
+        try c.sendReadyMessage(io);
+        try c.receiveMessage(io);
     }
     c.close();
 }

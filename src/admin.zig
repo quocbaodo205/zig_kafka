@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
 const topic = @import("topic.zig");
@@ -10,7 +10,7 @@ const ADMIN_PORT: u16 = 10000;
 pub const KAdmin = struct {
     const Self = @This();
 
-    admin_address: net.Address,
+    admin_address: net.IpAddress,
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
 
@@ -24,7 +24,7 @@ pub const KAdmin = struct {
 
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init() !Self {
-        const address = try net.Address.parseIp4("127.0.0.1", ADMIN_PORT);
+        const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
         return Self{
             .admin_address = address,
             .read_buffer = undefined,
@@ -39,23 +39,23 @@ pub const KAdmin = struct {
     }
 
     /// Main function to start an admin server and wait for a message
-    pub fn startAdminServer(self: *Self) !void {
+    pub fn startAdminServer(self: *Self, io: std.Io) !void {
         // Create a server on the address and wait for a connection
-        var server = try self.admin_address.listen(.{ .reuse_address = true }); // TCP server
-        const connection = try server.accept(); // Block until got a connection
+        var server = try self.admin_address.listen(io, .{ .reuse_address = true }); // TCP server
+        const stream = try server.accept(io); // Block until got a connection
 
         // Init the read/write stream.
-        var stream_rd = connection.stream.reader(&self.read_buffer);
-        var stream_wr = connection.stream.writer(&self.write_buffer);
+        var stream_rd = stream.reader(io, &self.read_buffer);
+        var stream_wr = stream.writer(io, &self.write_buffer);
 
         // Read and process message
         if (try message_util.readMessageFromStream(&stream_rd)) |message| {
-            if (try self.processAdminMessage(message)) |response_message| {
+            if (try self.processAdminMessage(io, message)) |response_message| {
                 try message_util.writeMessageToStream(&stream_wr, response_message);
             }
         }
 
-        server.stream.close(); // Close the stream after
+        stream.close(io); // Close the stream after
     }
 
     pub fn closeAdminServer(self: *Self) void {
@@ -94,7 +94,7 @@ pub const KAdmin = struct {
     }
 
     /// Read from a connected producer at index.
-    fn readFromProducer(self: *Self, pd: *producer.ProducerData) !void {
+    fn readFromProducer(self: *Self, io: std.Io, pd: *producer.ProducerData) !void {
         // Don't have to read if it's already reading or closed previously.
         if (pd.stream_state != 0) {
             return;
@@ -104,8 +104,8 @@ pub const KAdmin = struct {
         // Use the registered stream.
         var stream_read_buff: [1024]u8 = undefined;
         var stream_write_buff: [1024]u8 = undefined;
-        var stream_rd = pd.stream.reader(&stream_read_buff);
-        var stream_wr = pd.stream.writer(&stream_write_buff);
+        var stream_rd = pd.stream.reader(io, &stream_read_buff);
+        var stream_wr = pd.stream.writer(io, &stream_write_buff);
         // Read from the stream: Blocking until the stream is closed.
         while (true) {
             const read_result = message_util.readMessageFromStream(&stream_rd) catch |err| {
@@ -144,7 +144,7 @@ pub const KAdmin = struct {
     }
 
     /// Parse a message and call the correct processing function
-    fn processAdminMessage(self: *Self, message: message_util.Message) !?message_util.Message {
+    fn processAdminMessage(self: *Self, io: std.Io, message: message_util.Message) !?message_util.Message {
         switch (message) {
             message_util.MessageType.ECHO => |echo_message| {
                 const response_data = try self.processEchoMessage(echo_message);
@@ -153,13 +153,13 @@ pub const KAdmin = struct {
                 };
             },
             message_util.MessageType.P_REG => |producer_register_message| {
-                const response = try self.processProducerRegisterMessage(&producer_register_message);
+                const response = try self.processProducerRegisterMessage(io, &producer_register_message);
                 return message_util.Message{
                     .R_P_REG = response,
                 };
             },
             message_util.MessageType.C_REG => |consumer_register_message| {
-                const response = try self.processConsumerRegisterMessage(&consumer_register_message);
+                const response = try self.processConsumerRegisterMessage(io, &consumer_register_message);
                 return message_util.Message{
                     .R_C_REG = response,
                 };
@@ -176,10 +176,10 @@ pub const KAdmin = struct {
         return return_data;
     }
 
-    fn processProducerRegisterMessage(self: *Self, rm: *const message_util.ProducerRegisterMessage) !u8 {
+    fn processProducerRegisterMessage(self: *Self, io: std.Io, rm: *const message_util.ProducerRegisterMessage) !u8 {
         // Connect to the server and add a stream to the list:
-        const address = try net.Address.parseIp4("127.0.0.1", rm.port);
-        const stream = try net.tcpConnectToAddress(address);
+        const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
+        const stream = try address.connect(io, .{ .mode = .stream });
         // Put into a list of producer
         try self.producers.append(std.heap.page_allocator, producer.ProducerData.new(rm.topic, rm.port, stream, 0));
         const pd: *producer.ProducerData = &self.producers.items[self.producers.items.len - 1];
@@ -201,12 +201,12 @@ pub const KAdmin = struct {
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer on port {}, topic {}\n", .{ rm.port, rm.topic });
         // Upon register, just start consuming in another thread.
-        const thread = try std.Thread.spawn(.{}, KAdmin.readFromProducer, .{ @as(*Self, self), pd });
+        const thread = try std.Thread.spawn(.{}, KAdmin.readFromProducer, .{ @as(*Self, self), io, pd });
         try self.producer_threads.append(std.heap.page_allocator, thread);
         return 0;
     }
 
-    fn processConsumerRegisterMessage(self: *Self, rm: *const message_util.ConsumerRegisterMessage) !u8 {
+    fn processConsumerRegisterMessage(self: *Self, io: std.Io, rm: *const message_util.ConsumerRegisterMessage) !u8 {
         // Check if topic exist
         var exist = false;
         var tp: *topic.Topic = undefined;
@@ -221,8 +221,8 @@ pub const KAdmin = struct {
             return 1; // We only accept known topic.
         }
         // Connect to the server
-        const address = try net.Address.parseIp4("127.0.0.1", rm.port);
-        const stream = try net.tcpConnectToAddress(address);
+        const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
+        const stream = try address.connect(io, .{ .mode = .stream });
         // Add this data to the correct consumer group.
         // Check if consumer group with this ID exist, add if not
         exist = false;
@@ -239,12 +239,12 @@ pub const KAdmin = struct {
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
         }
         // Add the port, stream and stream_state
-        try cg.addConsumer(rm.port, stream);
+        try cg.addConsumer(io, rm.port, stream);
         // After start, can start advancing right away:
-        const thread = try std.Thread.spawn(.{}, topic.Topic.advanceConsumerGroup, .{ tp, cg });
+        const thread = try std.Thread.spawn(.{}, topic.Topic.advanceConsumerGroup, .{ tp, io, cg });
         try self.topic_threads.append(std.heap.page_allocator, thread);
         // Thread to start popping message from the topic queue
-        const pop_thread = try std.Thread.spawn(.{}, topic.Topic.tryPopMessage, .{tp});
+        const pop_thread = try std.Thread.spawn(.{}, topic.Topic.tryPopMessage, .{ tp, io });
         _ = pop_thread; // TODO: join with a way to cancel somehow on exit.
         return 0;
     }

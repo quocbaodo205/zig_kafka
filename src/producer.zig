@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const message_util = @import("message.zig");
 
 const ADMIN_PORT: u16 = 10000;
@@ -14,7 +14,7 @@ pub const ProducerProcess = struct {
 
     // Local var after creating a TCP server
     server: net.Server,
-    connection: net.Server.Connection,
+    stream: net.Stream,
 
     pub fn init(port: u16, topic: u32) !Self {
         return Self{
@@ -23,18 +23,18 @@ pub const ProducerProcess = struct {
             .read_buffer = undefined,
             .write_buffer = undefined,
             .server = undefined,
-            .connection = undefined,
+            .stream = undefined,
         };
     }
 
-    fn sendPortDataToKAdmin(self: *Self) !void {
+    fn sendPortDataToKAdmin(self: *Self, io: std.Io) !void {
         // Connect to kadmin process
-        const address = try net.Address.parseIp4("127.0.0.1", ADMIN_PORT);
-        var stream = try net.tcpConnectToAddress(address);
+        const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
+        var stream = try address.connect(io, .{ .mode = .stream });
 
         // Send register message to kadmin
-        var stream_rd = stream.reader(&self.read_buffer);
-        var stream_wr = stream.writer(&self.write_buffer);
+        var stream_rd = stream.reader(io, &self.read_buffer);
+        var stream_wr = stream.writer(io, &self.write_buffer);
         std.debug.print("Sent to server the port: {}, topic: {}\n", .{ self.port, self.topic });
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .P_REG = message_util.ProducerRegisterMessage{
@@ -49,24 +49,24 @@ pub const ProducerProcess = struct {
         // Stream should be closed by the kadmin, no need to close ourselve.
     }
 
-    pub fn startProducerServer(self: *Self) !void {
+    pub fn startProducerServer(self: *Self, io: std.Io) !void {
         // Open the server
-        const address = try net.Address.parseIp4("127.0.0.1", self.port);
-        self.server = try address.listen(.{ .reuse_address = true }); // TCP server
+        const address = try net.IpAddress.parseIp4("127.0.0.1", self.port);
+        self.server = try address.listen(io, .{ .reuse_address = true }); // TCP server
 
         // If no error, then send the port to admin
-        try self.sendPortDataToKAdmin();
+        try self.sendPortDataToKAdmin(io);
 
         // After that accept a connection.
-        self.connection = try self.server.accept(); // Block until got a connection
+        self.stream = try self.server.accept(io); // Block until got a connection
 
         // Later, we can use the self.connection to read / write message.
     }
 
-    pub fn writeTestMessage(self: *Self, message: []u8) !void {
+    pub fn writeTestMessage(self: *Self, io: std.Io, message: []u8) !void {
         // Init the read/write stream.
-        var stream_rd = self.connection.stream.reader(&self.read_buffer);
-        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        var stream_rd = self.stream.reader(io, &self.read_buffer);
+        var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Write echo message
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .ECHO = try std.fmt.allocPrint(std.heap.page_allocator, "Producer port {}, message = {s}", .{ self.port, message }),
@@ -78,12 +78,13 @@ pub const ProducerProcess = struct {
     }
 
     /// Write the input message to the stream in the correct PCM format
-    pub fn writeMessage(self: *Self, message: []u8) !void {
+    pub fn writeMessage(self: *Self, io: std.Io, message: []u8) !void {
         // Create timestamp
-        const ts: u64 = @intCast(std.time.timestamp());
+        const now = try std.Io.Clock.now(.real, io);
+        const ts: u64 = @intCast(std.Io.Timestamp.toMilliseconds(now));
         // Init the read/write stream.
-        var stream_rd = self.connection.stream.reader(&self.read_buffer);
-        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        var stream_rd = self.stream.reader(io, &self.read_buffer);
+        var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Write echo message
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .PCM = message_util.ProduceConsumeMessage{
@@ -99,7 +100,7 @@ pub const ProducerProcess = struct {
     }
 
     pub fn close(self: *Self) void {
-        self.server.stream.close();
+        self.stream.close();
     }
 };
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const queue = @import("queue.zig");
 const message_util = @import("message.zig");
 const consumer = @import("consumer.zig");
@@ -30,21 +30,21 @@ pub const CGroup = struct {
 
     /// Add a new consumer to a consumer group with the given group ID and return the consumer group position.
     /// Assume exist (check outside not in this function)
-    pub fn addConsumer(self: *Self, port: u16, stream: net.Stream) !void {
+    pub fn addConsumer(self: *Self, io: std.Io, port: u16, stream: net.Stream) !void {
         std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ port, self.group_topic, self.group_id });
         try self.consumers.append(std.heap.page_allocator, consumer.ConsumerData.new(port, stream, 0));
         const c: *consumer.ConsumerData = &self.consumers.items[self.consumers.items.len - 1];
         // Spawn a thread to process ready message right after add.
-        const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ self, c });
+        const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ self, io, c });
         _ = th; // No need to join
     }
 
-    pub fn processReadyMessageFromConsumer(self: *CGroup, c: *consumer.ConsumerData) !void {
+    pub fn processReadyMessageFromConsumer(self: *CGroup, io: std.Io, c: *consumer.ConsumerData) !void {
         // Internal for read and write
         var read_buffer: [1024]u8 = undefined;
         var write_buffer: [1024]u8 = undefined;
-        var stream_rd = c.stream.reader(&read_buffer);
-        var stream_wr = c.stream.writer(&write_buffer);
+        var stream_rd = c.stream.reader(io, &read_buffer);
+        var stream_wr = c.stream.writer(io, &write_buffer);
         // This will block until read
         if (try message_util.readMessageFromStream(&stream_rd)) |_| {
             std.debug.print("Got a ready from consumer {}\n", .{c.port});
@@ -60,7 +60,7 @@ pub const CGroup = struct {
     }
 
     /// Try to write a message to any consumer (block until consumed or error)
-    pub fn writeMessageToAnyConsumer(self: *Self, message: message_util.Message) !void {
+    pub fn writeMessageToAnyConsumer(self: *Self, io: std.Io, message: message_util.Message) !void {
         var global_err: ?anyerror = null;
         // Loop forever and get the first ready in the queue
         while (true) {
@@ -70,7 +70,7 @@ pub const CGroup = struct {
                 std.debug.print("Start writing to consumer port {}\n", .{c.port});
                 // Internal for write
                 var write_buffer: [1024]u8 = undefined;
-                var stream_wr = c.stream.writer(&write_buffer);
+                var stream_wr = c.stream.writer(io, &write_buffer);
                 message_util.writeMessageToStream(&stream_wr, message) catch |err| {
                     // Cannot write somehow
                     global_err = err;
@@ -79,7 +79,7 @@ pub const CGroup = struct {
                 };
                 // Internal for read: Have to read back the R_PCM
                 var read_buffer: [1024]u8 = undefined;
-                var stream_rd = c.stream.reader(&read_buffer);
+                var stream_rd = c.stream.reader(io, &read_buffer);
                 const response = message_util.readMessageFromStream(&stream_rd) catch |err| {
                     // Cannot read back
                     global_err = err;
@@ -91,7 +91,7 @@ pub const CGroup = struct {
                         std.debug.print("Got a R_PCM ack back from {}\n", .{c.port});
                         self.ready_lock.unlock();
                         // Spawn a thread to process ready message again.
-                        const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ self, c });
+                        const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ self, io, c });
                         _ = th; // No need to join
                         return; // Written to one of them, done.
                     }

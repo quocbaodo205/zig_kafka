@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const message_util = @import("message.zig");
 
 const ADMIN_PORT: u16 = 10000;
@@ -15,7 +15,7 @@ pub const ConsumerProcess = struct {
 
     // Local var after creating a TCP server
     server: net.Server,
-    connection: net.Server.Connection,
+    stream: net.Stream,
 
     pub fn init(port: u16, topic: u32, group_id: u32) !Self {
         return Self{
@@ -25,18 +25,18 @@ pub const ConsumerProcess = struct {
             .read_buffer = undefined,
             .write_buffer = undefined,
             .server = undefined,
-            .connection = undefined,
+            .stream = undefined,
         };
     }
 
-    fn sendInitDataToKAdmin(self: *Self) !void {
+    fn sendInitDataToKAdmin(self: *Self, io: std.Io) !void {
         // Connect to kadmin process
-        const address = try net.Address.parseIp4("127.0.0.1", ADMIN_PORT);
-        var stream = try net.tcpConnectToAddress(address);
+        const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
+        var stream = try address.connect(io, .{ .mode = .stream });
 
         // Send register message to kadmin
-        var stream_rd = stream.reader(&self.read_buffer);
-        var stream_wr = stream.writer(&self.write_buffer);
+        var stream_rd = stream.reader(io, &self.read_buffer);
+        var stream_wr = stream.writer(io, &self.write_buffer);
         std.debug.print("Sent to server the port: {}, topic: {}, group_id: {}\n", .{ self.port, self.topic, self.group_id });
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .C_REG = message_util.ConsumerRegisterMessage{
@@ -52,25 +52,25 @@ pub const ConsumerProcess = struct {
         // Stream should be closed by the kadmin, no need to close ourselve.
     }
 
-    pub fn startConsumerServer(self: *Self) !void {
+    pub fn startConsumerServer(self: *Self, io: std.Io) !void {
         // Open the server
-        const address = try net.Address.parseIp4("127.0.0.1", self.port);
-        self.server = try address.listen(.{ .reuse_address = true }); // TCP server
+        const address = try net.IpAddress.parseIp4("127.0.0.1", self.port);
+        self.server = try address.listen(io, .{ .reuse_address = true }); // TCP server
 
         // If no error, then send the port to admin
-        try self.sendInitDataToKAdmin();
+        try self.sendInitDataToKAdmin(io);
 
         // After that accept a connection.
-        self.connection = try self.server.accept(); // Block until got a connection
+        self.stream = try self.server.accept(io); // Block until got a connection
 
         // Later, we can use the self.connection to read / write message.
     }
 
     /// Block until the kadmin accept our ready message.
-    pub fn sendReadyMessage(self: *Self) !void {
+    pub fn sendReadyMessage(self: *Self, io: std.Io) !void {
         // Init the read/write stream.
-        var stream_rd = self.connection.stream.reader(&self.read_buffer);
-        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        var stream_rd = self.stream.reader(io, &self.read_buffer);
+        var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Send the ready message
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .C_RD = 0,
@@ -84,10 +84,10 @@ pub const ConsumerProcess = struct {
     }
 
     /// Block until we received a PCM message.
-    pub fn receiveMessage(self: *Self) !void {
+    pub fn receiveMessage(self: *Self, io: std.Io) !void {
         // Init the read/write stream.
-        var stream_rd = self.connection.stream.reader(&self.read_buffer);
-        var stream_wr = self.connection.stream.writer(&self.write_buffer);
+        var stream_rd = self.stream.reader(io, &self.read_buffer);
+        var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Read PCM message
         if (try message_util.readMessageFromStream(&stream_rd)) |message| {
             // Debug print

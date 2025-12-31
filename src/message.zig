@@ -1,6 +1,6 @@
 /// Utility to read/write to message from a stream
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 
 pub const MessageType = enum(u8) {
     ECHO = 1,
@@ -153,9 +153,9 @@ fn parseMessage(message: []u8) ?Message {
 }
 
 fn readFromStream(stream_rd: *net.Stream.Reader) !?[]u8 {
-    const header = try stream_rd.file_reader.interface.takeByte();
+    const header = try stream_rd.interface.takeByte();
     if (header != 0) {
-        const data = try stream_rd.file_reader.interface.take(header);
+        const data = try stream_rd.interface.take(header);
         return data;
     } else {
         return null;
