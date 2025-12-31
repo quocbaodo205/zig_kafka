@@ -9,10 +9,11 @@ pub const Topic = struct {
     const QueueType = queue.Queue(message_util.ProduceConsumeMessage, 1000);
 
     topic_id: u32,
+    // Message queue
     mq: QueueType,
     cgroups: std.ArrayList(CGroup),
-    cgroups_offset: std.ArrayList(usize),
-    is_advancing: bool,
+    // Sync data
+    is_advancing: bool, // To check if the topic has already started advancing
     mq_lock: std.Thread.RwLock.Impl,
     topic_lock: std.Thread.RwLock.Impl,
 
@@ -21,7 +22,6 @@ pub const Topic = struct {
             .topic_id = topic_id,
             .mq = QueueType.new(),
             .cgroups = try std.ArrayList(CGroup).initCapacity(std.heap.page_allocator, 10),
-            .cgroups_offset = try std.ArrayList(usize).initCapacity(std.heap.page_allocator, 10),
             .is_advancing = false,
             .mq_lock = std.Thread.RwLock.Impl{},
             .topic_lock = std.Thread.RwLock.Impl{},
@@ -29,32 +29,13 @@ pub const Topic = struct {
     }
 
     /// Add a new consumer group that consume messages from this topic
-    pub fn addCGroup(self: *Self, cgroup: *const CGroup) !void {
+    pub fn addNewCGroup(self: *Self, cgroup_id: u32, topic: u32) !void {
         self.mq_lock.lockShared(); // Block until acquire
         defer self.mq_lock.unlockShared(); // Release on exit
         self.topic_lock.lock(); // Block cgroup for adding
         defer self.topic_lock.unlockShared(); // Release on exit
-        try self.cgroups.append(std.heap.page_allocator, cgroup.*);
-        try self.cgroups_offset.append(std.heap.page_allocator, self.mq.pop_num); // First offset is the number of popped element.
-        std.debug.print("Added a consumer group: port = {}, topic = {} with offset 0\n", .{ cgroup.consumer_ports, self.topic_id });
-    }
-
-    /// Add a new consumer to a consumer group with the given group ID and return the consumer position.
-    /// Assume exist (check outside not in this function)
-    pub fn addConsumer(self: *Self, port: u16, stream: net.Stream, group_id: u32) !usize {
-        for (self.cgroups.items, 0..) |*cg, i| {
-            if (cg.group_id == group_id) {
-                std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ port, self.topic_id, group_id });
-                try cg.consumer_ports.append(std.heap.page_allocator, port);
-                try cg.consumer_streams.append(std.heap.page_allocator, stream);
-                try cg.consumer_streams_state.append(std.heap.page_allocator, 0);
-                // Spawn a thread to process ready message right after add.
-                const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ cg, cg.consumer_ports.items.len - 1 });
-                _ = th; // No need to join
-                return i;
-            }
-        }
-        return 0;
+        try self.cgroups.append(std.heap.page_allocator, try CGroup.new(cgroup_id, topic, self.mq.pop_num));
+        std.debug.print("Added a consumer group: port = {}, topic = {} with offset 0\n", .{ cgroup_id, self.topic_id });
     }
 
     /// Push a new message to be consumed
@@ -64,19 +45,18 @@ pub const Topic = struct {
         self.mq_lock.unlock(); // Release
     }
 
-    pub fn advanceConsumerGroup(self: *Self, pos: usize) !void {
+    pub fn advanceConsumerGroup(self: *Self, cgroup: *CGroup) !void {
         while (true) {
-            const offset = self.cgroups_offset.items[pos]; // Assume safe since only 1 thread can change the offset (this thread)
-            const message = self.mq.peek(offset);
+            const message = self.mq.peek(cgroup.offset);
             if (message == null) {
                 continue;
             }
             // Write message at that offset
-            self.cgroups.items[pos].writeMessageToAnyConsumer(message_util.Message{ .PCM = message.? }) catch |err| {
+            cgroup.writeMessageToAnyConsumer(message_util.Message{ .PCM = message.? }) catch |err| {
                 return err; // Return here since the error in unrecoverable
             };
             // Advance the offset if good.
-            self.cgroups_offset.items[pos] += 1;
+            cgroup.offset += 1;
         }
     }
 
@@ -92,8 +72,8 @@ pub const Topic = struct {
             std.Thread.sleep(10 * 1000000000); // Every 10s
             self.topic_lock.lockShared(); // Need the number of consumer group to be stable
             var min_offset: usize = 1000000000;
-            for (self.cgroups_offset.items) |offset| {
-                min_offset = @min(min_offset, offset);
+            for (self.cgroups.items) |*cg| {
+                min_offset = @min(min_offset, cg.offset);
             }
             std.debug.print("Get to popping in topic {}, min_offset = {}, pop_num = {}\n", .{ self.topic_id, min_offset, self.mq.pop_num });
             self.mq_lock.lock(); // Lock to pop

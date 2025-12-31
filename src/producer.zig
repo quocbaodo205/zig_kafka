@@ -4,7 +4,7 @@ const message_util = @import("message.zig");
 
 const ADMIN_PORT: u16 = 10000;
 
-pub const Producer = struct {
+pub const ProducerProcess = struct {
     const Self = @This();
 
     topic: u32,
@@ -100,5 +100,18 @@ pub const Producer = struct {
 
     pub fn close(self: *Self) void {
         self.server.stream.close();
+    }
+};
+
+pub const ProducerData = struct {
+    const Self = @This();
+
+    topic: u32,
+    port: u16,
+    stream: net.Stream,
+    stream_state: u8,
+
+    pub fn new(topic: u32, port: u16, stream: net.Stream, stream_state: u8) Self {
+        return Self{ .topic = topic, .port = port, .stream = stream, .stream_state = stream_state };
     }
 };

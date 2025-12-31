@@ -18,7 +18,7 @@ pub fn initProducer() !void {
     const port_int = try std.fmt.parseInt(u16, port_str, 10);
     const topic_str = std.mem.span(std.os.argv[3]); // 3rd argument is the topic
     const topic_int = try std.fmt.parseInt(u32, topic_str, 10);
-    var p = try producer.Producer.init(port_int, topic_int);
+    var p = try producer.ProducerProcess.init(port_int, topic_int);
     try p.startProducerServer();
     // Don't read from stdin anymore! Just run forever!
     while (true) {
@@ -33,7 +33,7 @@ pub fn initConsumer() !void {
     const topic = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[3]), 10); // 3rd argument is the topic
     const group = try std.fmt.parseInt(u32, std.mem.span(std.os.argv[4]), 10); // 4th argument is the topic
     const sleep_mili = try std.fmt.parseInt(u64, std.mem.span(std.os.argv[5]), 10); // 5th argument is the sleep time in milli
-    var c = try consumer.Consumer.init(port, topic, group);
+    var c = try consumer.ConsumerProcess.init(port, topic, group);
     try c.startConsumerServer();
     // Always try to receive message
     while (true) {
