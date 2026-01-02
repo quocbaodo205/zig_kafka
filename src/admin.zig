@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.Io.net;
+const Io = std.Io;
+const net = Io.net;
 const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
 const topic = @import("topic.zig");
@@ -20,11 +21,13 @@ pub const KAdmin = struct {
 
     // A list of producer.
     producers: std.ArrayList(producer.ProducerData),
-    producer_threads: std.ArrayList(std.Thread),
+    // producer_threads: std.ArrayList(std.Thread),
+    producers_queue: Io.Queue(producer.ProducerData),
 
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init() !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
+        const buffer = try std.heap.page_allocator.alloc(producer.ProducerData, 10);
         return Self{
             .admin_address = address,
             .read_buffer = undefined,
@@ -34,28 +37,30 @@ pub const KAdmin = struct {
             .topic_threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, 10),
             // Producer storage init
             .producers = try std.ArrayList(producer.ProducerData).initCapacity(std.heap.page_allocator, 10),
-            .producer_threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, 10),
+            .producers_queue = .init(buffer),
+            // .producer_threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, 10),
         };
     }
 
     /// Main function to start an admin server and wait for a message
-    pub fn startAdminServer(self: *Self, io: std.Io) !void {
+    pub fn startAdminServer(self: *Self, io: Io) !void {
         // Create a server on the address and wait for a connection
         var server = try self.admin_address.listen(io, .{ .reuse_address = true }); // TCP server
-        const stream = try server.accept(io); // Block until got a connection
 
-        // Init the read/write stream.
-        var stream_rd = stream.reader(io, &self.read_buffer);
-        var stream_wr = stream.writer(io, &self.write_buffer);
+        while (true) {
+            const stream = try server.accept(io); // Block until got a connection
 
-        // Read and process message
-        if (try message_util.readMessageFromStream(&stream_rd)) |message| {
-            if (try self.processAdminMessage(io, message)) |response_message| {
-                try message_util.writeMessageToStream(&stream_wr, response_message);
+            // Init the read/write stream.
+            var stream_rd = stream.reader(io, &self.read_buffer);
+            var stream_wr = stream.writer(io, &self.write_buffer);
+            // Read and process message
+            if (try message_util.readMessageFromStream(&stream_rd)) |message| {
+                if (try self.processAdminMessage(io, message)) |response_message| {
+                    try message_util.writeMessageToStream(&stream_wr, response_message);
+                }
             }
+            stream.close(io); // Close the stream after
         }
-
-        stream.close(io); // Close the stream after
     }
 
     pub fn closeAdminServer(self: *Self) void {
@@ -93,56 +98,6 @@ pub const KAdmin = struct {
         }
     }
 
-    /// Read from a connected producer at index.
-    fn readFromProducer(self: *Self, io: std.Io, pd: *producer.ProducerData) !void {
-        // Don't have to read if it's already reading or closed previously.
-        if (pd.stream_state != 0) {
-            return;
-        }
-        std.debug.print("Start reading from producer with port {}\n", .{pd.port});
-        pd.stream_state = 1;
-        // Use the registered stream.
-        var stream_read_buff: [1024]u8 = undefined;
-        var stream_write_buff: [1024]u8 = undefined;
-        var stream_rd = pd.stream.reader(io, &stream_read_buff);
-        var stream_wr = pd.stream.writer(io, &stream_write_buff);
-        // Read from the stream: Blocking until the stream is closed.
-        while (true) {
-            const read_result = message_util.readMessageFromStream(&stream_rd) catch |err| {
-                switch (err) {
-                    error.EndOfStream => {
-                        // Producer closed the stream, no need to read again.
-                        break;
-                    },
-                    else => {
-                        return err;
-                    },
-                }
-            };
-            if (read_result) |message| {
-                if (try self.processProducerMessage(message, pd)) |response_message| {
-                    try message_util.writeMessageToStream(&stream_wr, response_message);
-                }
-            }
-        }
-        std.debug.print("Producer on port {} is gone\n", .{pd.port});
-    }
-
-    fn processProducerMessage(self: *Self, message: message_util.Message, pd: *producer.ProducerData) !?message_util.Message {
-        switch (message) {
-            message_util.MessageType.PCM => |pcm| {
-                const response = try self.processPCM(&pcm, pd);
-                return message_util.Message{
-                    .R_PCM = response,
-                };
-            },
-            else => {
-                // TODO: Process another message.
-                return null;
-            },
-        }
-    }
-
     /// Parse a message and call the correct processing function
     fn processAdminMessage(self: *Self, io: std.Io, message: message_util.Message) !?message_util.Message {
         switch (message) {
@@ -176,6 +131,7 @@ pub const KAdmin = struct {
         return return_data;
     }
 
+    // =========================== Producer ======================
     fn processProducerRegisterMessage(self: *Self, io: std.Io, rm: *const message_util.ProducerRegisterMessage) !u8 {
         // Connect to the server and add a stream to the list:
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
@@ -200,12 +156,90 @@ pub const KAdmin = struct {
         }
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer on port {}, topic {}\n", .{ rm.port, rm.topic });
-        // Upon register, just start consuming in another thread.
-        const thread = try std.Thread.spawn(.{}, KAdmin.readFromProducer, .{ @as(*Self, self), io, pd });
-        try self.producer_threads.append(std.heap.page_allocator, thread);
+        // Upon register, put it to the queue.
+        try self.producers_queue.putOne(io, pd.*);
         return 0;
     }
 
+    pub fn handleProducerCreate(self: *Self, io: Io) !void {
+        var group = Io.Group.init;
+        while (true) {
+            var pd = try self.producers_queue.getOne(io);
+            std.debug.print("Got one with port {}\n", .{pd.port});
+            try group.concurrent(io, KAdmin.readFromProducer, .{ self, io, &pd });
+        }
+        group.wait();
+    }
+
+    /// Read from a connected producer at index.
+    fn readFromProducer(self: *Self, io: std.Io, pd: *producer.ProducerData) void {
+        std.debug.print("Start reading from producer with port {}\n", .{pd.port});
+        // Use the registered stream.
+        var stream_read_buff: [1024]u8 = undefined;
+        var stream_write_buff: [1024]u8 = undefined;
+        var stream_rd = pd.stream.reader(io, &stream_read_buff);
+        var stream_wr = pd.stream.writer(io, &stream_write_buff);
+        // Read from the stream: Blocking until the stream is closed.
+        while (true) {
+            var read_task = message_util.readMessageFromStreamAsync(io, &stream_rd);
+            const put_res = self.processAsyncPCM(io, &read_task, pd) catch {
+                @panic("Cannot process message correctly...");
+            };
+            message_util.writeMessageToStream(&stream_wr, message_util.Message{
+                .R_PCM = put_res,
+            }) catch {
+                @panic("Cannot write to stream");
+            };
+        }
+        std.debug.print("Producer on port {} is gone\n", .{pd.port});
+    }
+
+    /// Pretty sure it's gonna be PCM...
+    fn processAsyncPCM(self: *Self, io: std.Io, message_task: *message_util.message_future, pd: *producer.ProducerData) !u8 {
+        // Send this message to the correct topic
+        for (self.topics.items) |*tp| {
+            if (tp.topic_id == pd.topic) {
+                tp.addAsyncMessage(io, message_task);
+                return 0;
+            }
+        }
+        return 1; // Cannot find the topic!
+    }
+
+    fn processProducerMessage(self: *Self, io: std.Io, message: message_util.Message, pd: *producer.ProducerData) !?message_util.Message {
+        switch (message) {
+            message_util.MessageType.PCM => |pcm| {
+                const response = try self.processPCM(io, &pcm, pd);
+                return message_util.Message{
+                    .R_PCM = response,
+                };
+            },
+            else => {
+                // TODO: Process another message.
+                return null;
+            },
+        }
+    }
+
+    fn processPCM(self: *Self, io: std.Io, pcm: *const message_util.ProduceConsumeMessage, pd: *producer.ProducerData) !u8 {
+        // Send this message to the correct topic
+        for (self.topics.items) |*tp| {
+            if (tp.topic_id == pd.topic) {
+                var copyData = try std.heap.page_allocator.create(message_util.ProduceConsumeMessage);
+                copyData.producer_port = pcm.producer_port;
+                copyData.timestamp = pcm.timestamp;
+                copyData.message = try std.heap.page_allocator.alloc(u8, pcm.message.len);
+                @memcpy(copyData.message, pcm.message);
+                tp.addMessage(io, copyData);
+                return 0;
+            }
+        }
+        return 1; // Cannot find the topic!
+    }
+
+    // ============================= Consumer ============================
+
+    /// Return the position of the consumer in the list
     fn processConsumerRegisterMessage(self: *Self, io: std.Io, rm: *const message_util.ConsumerRegisterMessage) !u8 {
         // Check if topic exist
         var exist = false;
@@ -218,7 +252,7 @@ pub const KAdmin = struct {
             }
         }
         if (!exist) {
-            return 1; // We only accept known topic.
+            return 255; // We only accept known topic.
         }
         // Connect to the server
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
@@ -239,29 +273,13 @@ pub const KAdmin = struct {
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
         }
         // Add the port, stream and stream_state
-        try cg.addConsumer(io, rm.port, stream);
+        const pos = try cg.addConsumer(io, rm.port, stream);
         // After start, can start advancing right away:
         const thread = try std.Thread.spawn(.{}, topic.Topic.advanceConsumerGroup, .{ tp, io, cg });
         try self.topic_threads.append(std.heap.page_allocator, thread);
         // Thread to start popping message from the topic queue
         const pop_thread = try std.Thread.spawn(.{}, topic.Topic.tryPopMessage, .{ tp, io });
         _ = pop_thread; // TODO: join with a way to cancel somehow on exit.
-        return 0;
-    }
-
-    fn processPCM(self: *Self, pcm: *const message_util.ProduceConsumeMessage, pd: *producer.ProducerData) !u8 {
-        // Send this message to the correct topic
-        for (self.topics.items) |*tp| {
-            if (tp.topic_id == pd.topic) {
-                var copyData = try std.heap.page_allocator.create(message_util.ProduceConsumeMessage);
-                copyData.producer_port = pcm.producer_port;
-                copyData.timestamp = pcm.timestamp;
-                copyData.message = try std.heap.page_allocator.alloc(u8, pcm.message.len);
-                @memcpy(copyData.message, pcm.message);
-                tp.addMessage(copyData);
-                return 0;
-            }
-        }
-        return 1; // Cannot find the topic!
+        return pos;
     }
 };

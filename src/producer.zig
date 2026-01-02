@@ -93,6 +93,7 @@ pub const ProducerProcess = struct {
                 .timestamp = ts,
             },
         });
+        std.debug.print("Written Ping from {}\n", .{self.port});
         // Read back response echo message
         if (try message_util.readMessageFromStream(&stream_rd)) |m| {
             std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});

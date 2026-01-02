@@ -37,15 +37,17 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
         }
 
         /// Push an element to the back of the deque
-        pub fn push_back(self: *Self, element: *const T) void {
+        pub fn push_back(self: *Self, element: *const T) bool {
             // Add at r
             if (self.arr[self.r] != null) {
-                @panic("Array filled and cannot add more element!");
+                return false;
+                // @panic("Array filled and cannot add more element!");
             }
             self.arr[self.r] = element.*; // Deref to copy inside
             self.r += 1;
             self.len += 1;
             if (self.r >= max_n) self.r = 0;
+            return true;
         }
 
         /// Pop return an element from the front of the deque

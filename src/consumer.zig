@@ -12,6 +12,7 @@ pub const ConsumerProcess = struct {
     group_id: u32,
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
+    position: u8,
 
     // Local var after creating a TCP server
     server: net.Server,
@@ -26,6 +27,7 @@ pub const ConsumerProcess = struct {
             .write_buffer = undefined,
             .server = undefined,
             .stream = undefined,
+            .position = undefined,
         };
     }
 
@@ -48,6 +50,7 @@ pub const ConsumerProcess = struct {
         // Try to read back the response from kadmin
         if (try message_util.readMessageFromStream(&stream_rd)) |res| {
             std.debug.print("Received ACK from server: {}\n", .{res.R_C_REG});
+            self.position = res.R_C_REG;
         }
         // Stream should be closed by the kadmin, no need to close ourselve.
     }
@@ -73,7 +76,7 @@ pub const ConsumerProcess = struct {
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Send the ready message
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-            .C_RD = 0,
+            .C_RD = self.position,
         });
         std.debug.print("Sent ready to kadmin for consumer on port {}\n", .{self.port});
         // Read ACK message

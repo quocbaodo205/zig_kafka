@@ -1,6 +1,7 @@
 /// Utility to read/write to message from a stream
 const std = @import("std");
-const net = std.Io.net;
+const Io = std.Io;
+const net = Io.net;
 
 pub const MessageType = enum(u8) {
     ECHO = 1,
@@ -113,6 +114,9 @@ pub const Message = union(MessageType) {
     R_C_RD: u8, // Just ack
 };
 
+pub const message_future =
+    Io.Future(@typeInfo(@typeInfo(@TypeOf(readMessageFromStream)).@"fn".return_type.?).error_union.error_set!?Message);
+
 fn parseMessage(message: []u8) ?Message {
     switch (message[0]) {
         @intFromEnum(MessageType.ECHO) => {
@@ -170,6 +174,10 @@ pub fn readMessageFromStream(stream_rd: *net.Stream.Reader) !?Message {
     } else {
         return null;
     }
+}
+
+pub fn readMessageFromStreamAsync(io: Io, stream_rd: *net.Stream.Reader) message_future {
+    return io.async(readMessageFromStream, .{stream_rd});
 }
 
 fn writeDataToStreamWithType(stream_wr: *net.Stream.Writer, mtype: u8, data: []u8) !void {

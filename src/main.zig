@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.Io.net;
+const Io = std.Io;
+const net = Io.net;
 const kadmin = @import("admin.zig");
 const message_util = @import("message.zig");
 const producer = @import("producer.zig");
@@ -10,11 +11,17 @@ pub fn initKAdmin() !void {
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    // var group = Io.Group.init;
     var admin = try kadmin.KAdmin.init();
-    while (true) {
-        try admin.startAdminServer(io);
-    }
-    defer admin.closeAdminServer();
+
+    var server_task = try io.concurrent(kadmin.KAdmin.startAdminServer, .{ &admin, io });
+    defer server_task.cancel(io) catch {};
+
+    var producer_task = try io.concurrent(kadmin.KAdmin.handleProducerCreate, .{ &admin, io });
+    defer producer_task.cancel(io) catch {};
+
+    try server_task.await(io);
+    try producer_task.await(io);
 }
 
 pub fn initProducer() !void {
@@ -30,8 +37,8 @@ pub fn initProducer() !void {
     try p.startProducerServer(io);
     // Don't read from stdin anymore! Just run forever!
     while (true) {
-        try std.Io.sleep(io, .fromSeconds(1), .awake);
         try p.writeMessage(io, try std.fmt.allocPrint(std.heap.page_allocator, "Ping from {}", .{port_int}));
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
     }
     p.close();
 }

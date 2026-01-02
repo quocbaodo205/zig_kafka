@@ -39,9 +39,41 @@ pub const Topic = struct {
     }
 
     /// Push a new message to be consumed
-    pub fn addMessage(self: *Self, message: *message_util.ProduceConsumeMessage) void {
+    pub fn addAsyncMessage(self: *Self, io: std.Io, message_task: *message_util.message_future) void {
+        // await and parse
+        const message = message_task.await(io) catch {
+            self.mq_lock.unlock(); // Release
+            @panic("Read error");
+        };
         self.mq_lock.lock(); // Block until acquire
-        self.mq.push_back(message);
+        switch (message.?) {
+            message_util.MessageType.PCM => |*pcm| {
+                while (!self.mq.push_back(pcm)) {
+                    self.mq_lock.unlock(); // Release
+                    std.Io.sleep(io, .fromSeconds(1), .awake) catch {
+                        @panic("Cannot sleep!");
+                    };
+                    self.mq_lock.lock(); // Block until acquire
+                }
+                self.mq_lock.unlock(); // Release
+            },
+            else => {
+                self.mq_lock.unlock(); // Release
+                return;
+            },
+        }
+    }
+
+    /// Push a new message to be consumed
+    pub fn addMessage(self: *Self, io: std.Io, message: *message_util.ProduceConsumeMessage) void {
+        self.mq_lock.lock(); // Block until acquire
+        while (!self.mq.push_back(message)) {
+            self.mq_lock.unlock(); // Release
+            std.Io.sleep(io, .fromSeconds(1), .awake) catch {
+                @panic("Cannot sleep!");
+            };
+            self.mq_lock.lock(); // Block until acquire
+        }
         self.mq_lock.unlock(); // Release
     }
 

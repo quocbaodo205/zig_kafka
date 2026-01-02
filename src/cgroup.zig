@@ -30,13 +30,15 @@ pub const CGroup = struct {
 
     /// Add a new consumer to a consumer group with the given group ID and return the consumer group position.
     /// Assume exist (check outside not in this function)
-    pub fn addConsumer(self: *Self, io: std.Io, port: u16, stream: net.Stream) !void {
+    pub fn addConsumer(self: *Self, io: std.Io, port: u16, stream: net.Stream) !u8 {
         std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ port, self.group_topic, self.group_id });
         try self.consumers.append(std.heap.page_allocator, consumer.ConsumerData.new(port, stream, 0));
-        const c: *consumer.ConsumerData = &self.consumers.items[self.consumers.items.len - 1];
+        const pos = self.consumers.items.len - 1;
+        const c: *consumer.ConsumerData = &self.consumers.items[pos];
         // Spawn a thread to process ready message right after add.
         const th = try std.Thread.spawn(.{}, CGroup.processReadyMessageFromConsumer, .{ self, io, c });
         _ = th; // No need to join
+        return @intCast(pos);
     }
 
     pub fn processReadyMessageFromConsumer(self: *CGroup, io: std.Io, c: *consumer.ConsumerData) !void {
@@ -51,7 +53,7 @@ pub const CGroup = struct {
             self.ready_lock.lock();
             defer self.ready_lock.unlock();
             std.debug.print("Locked the ready queue\n", .{});
-            self.ready_consumer_mq.push_back(&c);
+            _ = self.ready_consumer_mq.push_back(&c);
             try message_util.writeMessageToStream(&stream_wr, message_util.Message{
                 .R_C_RD = 0,
             });
