@@ -29,7 +29,7 @@ pub const CGroup = struct {
             .group_topic = topic,
             .offset = offset,
             // Consumers
-            .consumers = try std.ArrayList(consumer.ConsumerData).initCapacity(std.heap.page_allocator, 10),
+            .consumers = try std.ArrayList(consumer.ConsumerData).initCapacity(gpa, 10),
             .ready_lock = std.Thread.RwLock.Impl{},
             .ready_consumer_mq = queue.Queue(*consumer.ConsumerData, 1000).new(),
             // Async stuff
@@ -41,9 +41,9 @@ pub const CGroup = struct {
 
     /// Add a new consumer to a consumer group with the given group ID and return the consumer group position.
     /// Assume exist (check outside not in this function)
-    pub fn addConsumer(self: *Self, io: std.Io, port: u16, stream: net.Stream) !u8 {
+    pub fn addConsumer(self: *Self, io: std.Io, gpa: Allocator, port: u16, stream: net.Stream) !u8 {
         std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ port, self.group_topic, self.group_id });
-        try self.consumers.append(std.heap.page_allocator, consumer.ConsumerData.new(port, stream, 0));
+        try self.consumers.append(gpa, consumer.ConsumerData.new(port, stream, 0));
         const pos = self.consumers.items.len - 1;
         const c: *consumer.ConsumerData = &self.consumers.items[pos];
         // Spawn a thread to process ready message right after add.

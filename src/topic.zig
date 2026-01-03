@@ -19,11 +19,11 @@ pub const Topic = struct {
     mq_lock: std.Thread.RwLock.Impl,
     topic_lock: std.Thread.RwLock.Impl,
 
-    pub fn new(topic_id: u32) !Self {
+    pub fn new(gpa: Allocator, topic_id: u32) !Self {
         return Self{
             .topic_id = topic_id,
             .mq = QueueType.new(),
-            .cgroups = try std.ArrayList(CGroup).initCapacity(std.heap.page_allocator, 10),
+            .cgroups = try std.ArrayList(CGroup).initCapacity(gpa, 10),
             .is_advancing = false,
             .mq_lock = std.Thread.RwLock.Impl{},
             .topic_lock = std.Thread.RwLock.Impl{},
@@ -36,7 +36,7 @@ pub const Topic = struct {
         defer self.mq_lock.unlockShared(); // Release on exit
         self.topic_lock.lock(); // Block cgroup for adding
         defer self.topic_lock.unlockShared(); // Release on exit
-        try self.cgroups.append(std.heap.page_allocator, try CGroup.new(gpa, cgroup_id, topic, self.mq.pop_num));
+        try self.cgroups.append(gpa, try CGroup.new(gpa, cgroup_id, topic, self.mq.pop_num));
         std.debug.print("Added a consumer group: port = {}, topic = {} with offset 0\n", .{ cgroup_id, self.topic_id });
     }
 

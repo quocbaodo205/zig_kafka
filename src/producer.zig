@@ -63,20 +63,6 @@ pub const ProducerProcess = struct {
         // Later, we can use the self.connection to read / write message.
     }
 
-    pub fn writeTestMessage(self: *Self, io: std.Io, message: []u8) !void {
-        // Init the read/write stream.
-        var stream_rd = self.stream.reader(io, &self.read_buffer);
-        var stream_wr = self.stream.writer(io, &self.write_buffer);
-        // Write echo message
-        try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-            .ECHO = try std.fmt.allocPrint(std.heap.page_allocator, "Producer port {}, message = {s}", .{ self.port, message }),
-        });
-        // Read back response echo message
-        if (try message_util.readMessageFromStream(&stream_rd)) |m| {
-            std.debug.print("Got back from the admin: {s}\n", .{m.R_ECHO});
-        }
-    }
-
     /// Write the input message to the stream in the correct PCM format
     pub fn writeMessage(self: *Self, io: std.Io, message: []u8) !void {
         // Create timestamp

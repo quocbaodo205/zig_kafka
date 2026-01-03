@@ -24,17 +24,17 @@ pub const KAdmin = struct {
     producers: std.ArrayList(producer.ProducerData),
 
     /// Init accept a buffer that will be used for all allocation and processing.
-    pub fn init() !Self {
+    pub fn init(gpa: Allocator) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
         return Self{
             .admin_address = address,
             .read_buffer = undefined,
             .write_buffer = undefined,
             // Topics
-            .topics = try std.ArrayList(topic.Topic).initCapacity(std.heap.page_allocator, 10),
-            .topic_threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, 10),
+            .topics = try std.ArrayList(topic.Topic).initCapacity(gpa, 10),
+            .topic_threads = try std.ArrayList(std.Thread).initCapacity(gpa, 10),
             // Producer storage init
-            .producers = try std.ArrayList(producer.ProducerData).initCapacity(std.heap.page_allocator, 10),
+            .producers = try std.ArrayList(producer.ProducerData).initCapacity(gpa, 10),
         };
     }
 
@@ -98,7 +98,7 @@ pub const KAdmin = struct {
     fn processAdminMessage(self: *Self, io: Io, gpa: Allocator, group: *Io.Group, message: message_util.Message) !?message_util.Message {
         switch (message) {
             message_util.MessageType.ECHO => |echo_message| {
-                const response_data = try self.processEchoMessage(echo_message);
+                const response_data = try self.processEchoMessage(gpa, echo_message);
                 return message_util.Message{
                     .R_ECHO = response_data,
                 };
@@ -122,8 +122,8 @@ pub const KAdmin = struct {
         }
     }
 
-    fn processEchoMessage(_: *Self, message: []u8) ![]u8 {
-        const return_data = try std.fmt.allocPrint(std.heap.page_allocator, "I have received: {s}", .{message});
+    fn processEchoMessage(_: *Self, gpa: Allocator, message: []u8) ![]u8 {
+        const return_data = try std.fmt.allocPrint(gpa, "I have received: {s}", .{message});
         return return_data;
     }
 
@@ -133,7 +133,7 @@ pub const KAdmin = struct {
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
         const stream = try address.connect(io, .{ .mode = .stream });
         // Put into a list of producer
-        try self.producers.append(std.heap.page_allocator, producer.ProducerData.new(rm.topic, rm.port, stream, 0));
+        try self.producers.append(gpa, producer.ProducerData.new(rm.topic, rm.port, stream, 0));
         const pd: *producer.ProducerData = &self.producers.items[self.producers.items.len - 1];
         // Add the topic if not exist
         var topic_exist = false;
@@ -144,7 +144,7 @@ pub const KAdmin = struct {
             }
         }
         if (!topic_exist) {
-            const new_topic = try topic.Topic.new(rm.topic);
+            const new_topic = try topic.Topic.new(gpa, rm.topic);
             try self.topics.append(
                 gpa,
                 new_topic,
@@ -198,37 +198,6 @@ pub const KAdmin = struct {
         return 1; // Cannot find the topic!
     }
 
-    fn processProducerMessage(self: *Self, io: std.Io, message: message_util.Message, pd: *producer.ProducerData) !?message_util.Message {
-        switch (message) {
-            message_util.MessageType.PCM => |pcm| {
-                const response = try self.processPCM(io, &pcm, pd);
-                return message_util.Message{
-                    .R_PCM = response,
-                };
-            },
-            else => {
-                // TODO: Process another message.
-                return null;
-            },
-        }
-    }
-
-    fn processPCM(self: *Self, io: std.Io, pcm: *const message_util.ProduceConsumeMessage, pd: *producer.ProducerData) !u8 {
-        // Send this message to the correct topic
-        for (self.topics.items) |*tp| {
-            if (tp.topic_id == pd.topic) {
-                var copyData = try std.heap.page_allocator.create(message_util.ProduceConsumeMessage);
-                copyData.producer_port = pcm.producer_port;
-                copyData.timestamp = pcm.timestamp;
-                copyData.message = try std.heap.page_allocator.alloc(u8, pcm.message.len);
-                @memcpy(copyData.message, pcm.message);
-                tp.addMessage(io, copyData);
-                return 0;
-            }
-        }
-        return 1; // Cannot find the topic!
-    }
-
     // ============================= Consumer ============================
 
     /// Return the position of the consumer in the list
@@ -267,7 +236,7 @@ pub const KAdmin = struct {
             try group.concurrent(io, topic.Topic.advanceConsumerGroup, .{ tp, io, cg });
         }
         // Add the port, stream and stream_state
-        const pos = try cg.addConsumer(io, rm.port, stream);
+        const pos = try cg.addConsumer(io, gpa, rm.port, stream);
         return pos;
     }
 };
