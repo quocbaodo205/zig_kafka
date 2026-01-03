@@ -1,10 +1,17 @@
 const std = @import("std");
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 const net = Io.net;
 const kadmin = @import("admin.zig");
 const message_util = @import("message.zig");
 const producer = @import("producer.zig");
 const consumer = @import("consumer.zig");
+
+pub fn startAdminServerPanic(self: *kadmin.KAdmin, io: Io, gpa: Allocator, group: *Io.Group) void {
+    self.startAdminServer(io, gpa, group) catch {
+        @panic("Cannot start admin server");
+    };
+}
 
 pub fn initKAdmin() !void {
     // Set up our I/O implementation.
@@ -14,14 +21,12 @@ pub fn initKAdmin() !void {
     // var group = Io.Group.init;
     var admin = try kadmin.KAdmin.init();
 
-    var server_task = try io.concurrent(kadmin.KAdmin.startAdminServer, .{ &admin, io });
-    defer server_task.cancel(io) catch {};
+    const gpa = std.heap.page_allocator;
 
-    var producer_task = try io.concurrent(kadmin.KAdmin.handleProducerCreate, .{ &admin, io });
-    defer producer_task.cancel(io) catch {};
+    var group = Io.Group.init;
+    try group.concurrent(io, startAdminServerPanic, .{ &admin, io, gpa, &group });
 
-    try server_task.await(io);
-    try producer_task.await(io);
+    group.wait(io); // Clean up everything.
 }
 
 pub fn initProducer() !void {

@@ -1,4 +1,6 @@
 const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
 const queue = @import("queue.zig");
 const CGroup = @import("cgroup.zig").CGroup;
 const net = std.net;
@@ -29,12 +31,12 @@ pub const Topic = struct {
     }
 
     /// Add a new consumer group that consume messages from this topic
-    pub fn addNewCGroup(self: *Self, cgroup_id: u32, topic: u32) !void {
+    pub fn addNewCGroup(self: *Self, gpa: Allocator, cgroup_id: u32, topic: u32) !void {
         self.mq_lock.lockShared(); // Block until acquire
         defer self.mq_lock.unlockShared(); // Release on exit
         self.topic_lock.lock(); // Block cgroup for adding
         defer self.topic_lock.unlockShared(); // Release on exit
-        try self.cgroups.append(std.heap.page_allocator, try CGroup.new(cgroup_id, topic, self.mq.pop_num));
+        try self.cgroups.append(std.heap.page_allocator, try CGroup.new(gpa, cgroup_id, topic, self.mq.pop_num));
         std.debug.print("Added a consumer group: port = {}, topic = {} with offset 0\n", .{ cgroup_id, self.topic_id });
     }
 
@@ -77,22 +79,23 @@ pub const Topic = struct {
         self.mq_lock.unlock(); // Release
     }
 
-    pub fn advanceConsumerGroup(self: *Self, io: std.Io, cgroup: *CGroup) !void {
+    pub fn advanceConsumerGroup(self: *Self, io: std.Io, cgroup: *CGroup) void {
         while (true) {
             const message = self.mq.peek(cgroup.offset);
             if (message == null) {
                 continue;
             }
             // Write message at that offset
-            cgroup.writeMessageToAnyConsumer(io, message_util.Message{ .PCM = message.? }) catch |err| {
-                return err; // Return here since the error in unrecoverable
+            cgroup.writeMessageToAnyConsumer(io, message_util.Message{ .PCM = message.? }) catch {
+                // @panic("Stream cannot be written"); // TODO: Log what?
+                return;
             };
             // Advance the offset if good.
             cgroup.offset += 1;
         }
     }
 
-    pub fn tryPopMessage(self: *Self, io: std.Io) !void {
+    pub fn tryPopMessage(self: *Self, io: std.Io) void {
         self.topic_lock.lock();
         if (self.is_advancing) {
             self.topic_lock.unlock();
@@ -101,7 +104,9 @@ pub const Topic = struct {
         self.is_advancing = true;
         self.topic_lock.unlock();
         while (true) {
-            try std.Io.sleep(io, .fromSeconds(10), .awake); // Every 10s
+            std.Io.sleep(io, .fromSeconds(10), .awake) catch {
+                return;
+            }; // Every 10s
             self.topic_lock.lockShared(); // Need the number of consumer group to be stable
             var min_offset: usize = 1000000000;
             for (self.cgroups.items) |*cg| {

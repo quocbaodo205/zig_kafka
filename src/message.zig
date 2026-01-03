@@ -176,6 +176,16 @@ pub fn readMessageFromStream(stream_rd: *net.Stream.Reader) !?Message {
     }
 }
 
+/// Put into a queue on done. This should be use in an async or concurrent.
+pub fn readMessageFromStreamPutQueue(io: Io, stream_rd: *net.Stream.Reader, queue: Io.Queue(Message)) !void {
+    const data = try readFromStream(stream_rd);
+    if (data) |m| {
+        if (parseMessage(m)) |ms| {
+            try queue.putOne(io, ms);
+        }
+    }
+}
+
 pub fn readMessageFromStreamAsync(io: Io, stream_rd: *net.Stream.Reader) message_future {
     return io.async(readMessageFromStream, .{stream_rd});
 }
