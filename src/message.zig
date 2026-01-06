@@ -117,7 +117,7 @@ pub const Message = union(MessageType) {
 pub const message_future =
     Io.Future(@typeInfo(@typeInfo(@TypeOf(readMessageFromStream)).@"fn".return_type.?).error_union.error_set!?Message);
 
-fn parseMessage(message: []u8) ?Message {
+pub fn parseMessage(message: []u8) ?Message {
     switch (message[0]) {
         @intFromEnum(MessageType.ECHO) => {
             return Message{ .ECHO = message[1..] };
