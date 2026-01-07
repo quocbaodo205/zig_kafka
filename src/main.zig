@@ -179,33 +179,33 @@ fn acceptFromClient() !void {
     try io.sleep(.fromSeconds(10), .awake);
 }
 
-// pub fn startAdminServerPanic(self: *kadmin.KAdmin, io: Io, gpa: Allocator, group: *Io.Group) void {
-//     self.startAdminServer(io, gpa, group) catch {
-//         @panic("Cannot start admin server");
-//     };
-// }
+pub fn startAdminServerPanic(self: *kadmin.KAdmin, io: Io, gpa: Allocator, group: *Io.Group) void {
+    self.startAdminServer(io, gpa, group) catch {
+        @panic("Cannot start admin server");
+    };
+}
 
-// pub fn initKAdmin() !void {
-//     const gpa = std.heap.smp_allocator;
+pub fn initKAdmin() !void {
+    const gpa = std.heap.smp_allocator;
 
-//     // Set up our I/O implementation.
-//     var threaded: std.Io.Threaded = .init(gpa, .{
-//         // .async_limit = .limited(8),
-//         // .concurrent_limit = .limited(8),
-//     });
-//     defer threaded.deinit();
-//     const io = threaded.io();
-//     // const evented = try gpa.create(std.Io.Evented);
-//     // try std.Io.Evented.init(evented, gpa, .{});
-//     // defer evented.deinit();
-//     // const io = evented.io();
+    // Set up our I/O implementation.
+    var threaded: std.Io.Threaded = .init(gpa, .{
+        // .async_limit = .limited(8),
+        // .concurrent_limit = .limited(8),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    // const evented = try gpa.create(std.Io.Evented);
+    // try std.Io.Evented.init(evented, gpa, .{});
+    // defer evented.deinit();
+    // const io = evented.io();
 
-//     var admin = try kadmin.KAdmin.init(gpa);
-//     var group = Io.Group.init;
-//     try group.concurrent(io, startAdminServerPanic, .{ &admin, io, gpa, &group });
-
-//     try group.await(io); // Clean up everything.
-// }
+    var admin = try kadmin.KAdmin.init(gpa);
+    var group = Io.Group.init;
+    // std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{&admin, io, gpa});
+    try group.concurrent(io, startAdminServerPanic, .{ &admin, io, gpa, &group });
+    try group.await(io); // Clean up everything.
+}
 
 // pub fn initProducer() !void {
 //     const gpa = std.heap.smp_allocator;
@@ -251,14 +251,14 @@ fn acceptFromClient() !void {
 pub fn main() !void {
     if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "server")) {
         // try uringStartEchoServer(); // Already tested.
-        try uringStartReadServer();
-        // try initKAdmin();
+        // try uringStartReadServer();
+        try initKAdmin();
         // } else if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "producer")) {
         //     try initProducer();
         // } else if (std.mem.eql(u8, std.mem.span(std.os.argv[1]), "consumer")) {
         //     try initConsumer();
     } else {
         // TODO: Init other type of process
-        try acceptFromClient();
+        // try acceptFromClient();
     }
 }
