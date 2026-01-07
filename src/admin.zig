@@ -27,12 +27,13 @@ pub const KAdmin = struct {
     // 3 rings:
     admin_messages_ring: iou,
     producer_messages_ring: iou,
+    producer_messages_buffer_group: iou.BufferGroup,
     all_consumers_ring: iou,
 
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init(gpa: Allocator) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
-        return Self{
+        var s = Self{
             .admin_address = address,
             .read_buffer = undefined,
             .write_buffer = undefined,
@@ -44,8 +45,11 @@ pub const KAdmin = struct {
             // Ring init
             .admin_messages_ring = try iou.init(1 << 7, 0),
             .producer_messages_ring = try iou.init(1 << 7, 0),
+            .producer_messages_buffer_group = undefined,
             .all_consumers_ring = try iou.init(1 << 7, 0),
         };
+        s.producer_messages_buffer_group = try iou.BufferGroup.init(s.producer_messages_ring, gpa, 1, 1024, 1 << 3);
+        return s;
     }
 
     /// Main function to start an admin server and wait for a message
@@ -55,6 +59,7 @@ pub const KAdmin = struct {
 
         // io_uring
         _ = try self.admin_messages_ring.accept_multishot(0, server.socket.handle, &null, null, 0);
+        _ = try self.admin_messages_ring.submit();
 
         // Event loop to process admin accept
         // Use inline completion since these messages are supposed to be quick.
@@ -185,11 +190,81 @@ pub const KAdmin = struct {
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer on port {}, topic {}\n", .{ rm.port, rm.topic });
         // Upon register, put it to the queue.
-        group.concurrent(io, KAdmin.readFromProducer, .{ self, io, pd }) catch {
-            @panic("Cannot start reading from producer");
-        };
-        // try self.producers_queue.putOne(io, pd.*);
+        // TODO: queue an accept multishot here...
+        const pd_data = @intFromPtr(pd);
+        _ = try self.producer_messages_buffer_group.recv_multishot(pd_data, stream.socket.handle, 0);
+        _ = try self.producer_messages_ring.submit();
+        // group.concurrent(io, KAdmin.readFromProducer, .{ self, io, pd }) catch {
+        //     @panic("Cannot start reading from producer");
+        // };
         return 0;
+    }
+
+    fn handleProducerMessages(self: *Self, io: Io, gpa: Allocator) void {
+        // Event loop (wait until completion queue has something)
+
+        // Create a buffer of cqe to handle batch read of messages.
+        // Process them in batch
+        var cqes: [1 << 6]std.os.linux.io_uring_cqe = undefined;
+        var write_buf: [1024]u8 = undefined;
+        var topic_messages_map = std.AutoArrayHashMap(u32, *std.ArrayList(message_util.ProduceConsumeMessage)).init(gpa);
+
+        while (true) {
+            // Will wait until we have an entry.
+            const num_ready = try self.producer_messages_ring.copy_cqes(&cqes, 1);
+            // TODO: Group them by topic to send messages at once for max efficiency.
+            for (cqes[0..num_ready]) |comp_entry| {
+                const err = comp_entry.err();
+                if (err == .SUCCESS) {
+                    const pd: *producer.ProducerData = @ptrFromInt(@as(usize, @intCast(comp_entry.user_data)));
+                    const byte_read: usize = @intCast(comp_entry.res); // The number of byte read.
+                    if (byte_read == 0) {
+                        pd.stream.close(io);
+                        continue;
+                    }
+                    const data_full = try self.producer_messages_ring.get(comp_entry); // Get result for this cqe
+                    // First is #bytes
+                    const data = data_full[1..];
+                    var wr = pd.stream.writer(io, &write_buf);
+                    if (message_util.parseMessage(data)) |m| {
+                        switch (m) {
+                            message_util.MessageType.PCM => |pcm| {
+                                std.debug.print("Received pcm = {s} from pd = {}, message port = {} at {}\n", .{ pcm.message, pd.port, pcm.producer_port, pcm.timestamp });
+                                // TODO: Get the topic and put the message there.
+                                const entry = topic_messages_map.get(pd.topic);
+                                if (entry) |f| {
+                                    f.append(
+                                        gpa,
+                                    );
+                                } else {
+                                    // TODO: Still missing the pd to get the stream and send back...
+                                    // Probably we can use the position instead of the pointer...
+                                    const n = try gpa.create(std.ArrayList(message_util.ProduceConsumeMessage));
+                                    n.* = try std.ArrayList(message_util.ProduceConsumeMessage).initCapacity(gpa, 5);
+                                    try n.append(gpa, pcm);
+                                    topic_messages_map.put(pd.topic, n);
+                                }
+                                const resp = 0;
+                                try message_util.writeMessageToStream(&wr, message_util.Message{
+                                    .R_PCM = resp,
+                                });
+                            },
+                            // Per testing, we will not read back the message we just sent, so all is good.
+                            message_util.MessageType.R_PCM => |resp| {
+                                std.debug.print("Received my own r_pcm = {}\n", .{resp});
+                            },
+                            else => {
+                                // Ignore
+                            },
+                        }
+                    } else {
+                        std.debug.print("No message can be parsed\n", .{});
+                    }
+                } else {
+                    std.debug.print("Err = {any}\n", .{err});
+                }
+            }
+        }
     }
 
     /// Read from a connected producer at index.
