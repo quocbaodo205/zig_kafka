@@ -66,15 +66,18 @@ pub const Topic = struct {
         }
     }
 
-    /// Push a new message to be consumed
-    pub fn addMessage(self: *Self, io: std.Io, message: *message_util.ProduceConsumeMessage) void {
+    /// Push new messages to be consumed
+    pub fn addMessageMulti(self: *Self, io: std.Io, messages: []*message_util.ProduceConsumeMessage) void {
         self.mq_lock.lock(); // Block until acquire
-        while (!self.mq.push_back(message)) {
-            self.mq_lock.unlock(); // Release
-            std.Io.sleep(io, .fromSeconds(1), .awake) catch {
-                @panic("Cannot sleep!");
-            };
-            self.mq_lock.lock(); // Block until acquire
+        // Put all messages there.
+        for (messages) |message| {
+            while (!self.mq.push_back(message)) {
+                self.mq_lock.unlock(); // Release
+                std.Io.sleep(io, .fromSeconds(1), .awake) catch {
+                    @panic("Cannot sleep!");
+                };
+                self.mq_lock.lock(); // Block until acquire
+            }
         }
         self.mq_lock.unlock(); // Release
     }
