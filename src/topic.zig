@@ -15,7 +15,6 @@ pub const Topic = struct {
     mq: QueueType,
     cgroups: std.ArrayList(CGroup),
     // Sync data
-    is_advancing: bool, // To check if the topic has already started advancing
     mq_lock: std.Thread.RwLock.Impl,
     topic_lock: std.Thread.RwLock.Impl,
 
@@ -24,7 +23,6 @@ pub const Topic = struct {
             .topic_id = topic_id,
             .mq = QueueType.new(),
             .cgroups = try std.ArrayList(CGroup).initCapacity(gpa, 10),
-            .is_advancing = false,
             .mq_lock = std.Thread.RwLock.Impl{},
             .topic_lock = std.Thread.RwLock.Impl{},
         };
@@ -54,30 +52,7 @@ pub const Topic = struct {
         self.mq_lock.unlock(); // Release
     }
 
-    pub fn advanceConsumerGroup(self: *Self, io: std.Io, cgroup: *CGroup) void {
-        while (true) {
-            const message = self.mq.peek(cgroup.offset);
-            if (message == null) {
-                continue;
-            }
-            // Write message at that offset
-            cgroup.writeMessageToAnyConsumer(io, message_util.Message{ .PCM = message.? }) catch {
-                // @panic("Stream cannot be written"); // TODO: Log what?
-                return;
-            };
-            // Advance the offset if good.
-            cgroup.offset += 1;
-        }
-    }
-
     pub fn tryPopMessage(self: *Self, io: std.Io) void {
-        self.topic_lock.lock();
-        if (self.is_advancing) {
-            self.topic_lock.unlock();
-            return;
-        }
-        self.is_advancing = true;
-        self.topic_lock.unlock();
         while (true) {
             std.Io.sleep(io, .fromSeconds(10), .awake) catch {
                 return;

@@ -23,9 +23,6 @@ pub const KAdmin = struct {
     topics: std.ArrayList(topic.Topic),
     topic_threads: std.ArrayList(std.Thread),
 
-    // A list of producer.
-    producers: std.ArrayList(producer.ProducerData),
-
     aring: *iou,
     pring: *iou,
     cring: *iou,
@@ -42,8 +39,6 @@ pub const KAdmin = struct {
             // Topics
             .topics = try std.ArrayList(topic.Topic).initCapacity(gpa, 10),
             .topic_threads = try std.ArrayList(std.Thread).initCapacity(gpa, 10),
-            // Producer storage init
-            .producers = try std.ArrayList(producer.ProducerData).initCapacity(gpa, 10),
             // Ring init
             .aring = aring,
             .pring = pring,
@@ -168,8 +163,8 @@ pub const KAdmin = struct {
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
         const stream = try address.connect(io, .{ .mode = .stream });
         // Put into a list of producer
-        try self.producers.append(gpa, producer.ProducerData.new(rm.topic, rm.port, stream, 0));
-        const pd: *producer.ProducerData = &self.producers.items[self.producers.items.len - 1];
+        const pd: *producer.ProducerData = gpa.create(producer.ProducerData);
+        pd.* = producer.ProducerData.new(rm.topic, rm.port, stream, 0);
         // Add the topic if not exist
         var topic_exist = false;
         for (self.topics.items) |tp| {
