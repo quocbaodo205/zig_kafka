@@ -111,14 +111,18 @@ pub const ConsumerData = struct {
     const Self = @This();
 
     port: u16,
+    group_id: u32,
+    topic_id: u32,
     stream: net.Stream,
     stream_state: u8,
 
-    pub fn new(port: u16, stream: net.Stream, stream_state: u8) Self {
+    pub fn new(port: u16, group_id: u32, topic_id: u32, stream: net.Stream, stream_state: u8) Self {
         return Self{
             .port = port,
             .stream = stream,
             .stream_state = stream_state,
+            .group_id = group_id,
+            .topic_id = topic_id,
         };
     }
 };

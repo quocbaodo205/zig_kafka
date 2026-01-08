@@ -10,7 +10,7 @@ pub const CGroup = struct {
     const Self = @This();
 
     group_id: u32,
-    group_topic: u32,
+    topic_id: u32,
     offset: usize,
     // Consumers
     consumers: std.ArrayList(consumer.ConsumerData),
@@ -22,11 +22,11 @@ pub const CGroup = struct {
     ready_pos_message_tasks: []Io.Future(void),
     buffer: []message_util.Message,
 
-    pub fn new(gpa: Allocator, id: u32, topic: u32, offset: usize) !Self {
+    pub fn new(gpa: Allocator, group_id: u32, topic_id: u32, offset: usize) !Self {
         const buffer = try gpa.alloc(message_util.Message, 1024);
         return Self{
-            .group_id = id,
-            .group_topic = topic,
+            .group_id = group_id,
+            .topic_id = topic_id,
             .offset = offset,
             // Consumers
             .consumers = try std.ArrayList(consumer.ConsumerData).initCapacity(gpa, 10),
@@ -42,8 +42,8 @@ pub const CGroup = struct {
     /// Add a new consumer to a consumer group with the given group ID and return the consumer group position.
     /// Assume exist (check outside not in this function)
     pub fn addConsumer(self: *Self, io: std.Io, gpa: Allocator, port: u16, stream: net.Stream) !u8 {
-        std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ port, self.group_topic, self.group_id });
-        try self.consumers.append(gpa, consumer.ConsumerData.new(port, stream, 0));
+        std.debug.print("Added a consumer with port: {}, topic: {}, group: {}\n", .{ port, self.topic_id, self.group_id });
+        try self.consumers.append(gpa, consumer.ConsumerData.new(port, self.group_id, self.topic_id, stream, 0));
         const pos = self.consumers.items.len - 1;
         const c: *consumer.ConsumerData = &self.consumers.items[pos];
         // Spawn a thread to process ready message right after add.
@@ -60,54 +60,6 @@ pub const CGroup = struct {
         // This will block until read
         const task = try io.async(message_util.readMessageFromStreamPutQueue, .{ io, &stream_rd, self.ready_pos_message_queue });
         self.ready_pos_message_tasks[pos] = task;
-    }
-
-    /// Try to write a message to any consumer (block until consumed or error)
-    pub fn writeMessageToAnyConsumerAsync(self: *Self, io: std.Io, message: message_util.Message) !void {
-        var global_err: ?anyerror = null;
-        // Loop forever and get the first ready in the queue
-        const ms = try self.ready_pos_message_queue.getOne(io);
-        switch (ms) {
-            message_util.MessageType.C_RD => |pos| {
-                // On read one, await that stuff too
-                try io.await(self.ready_pos_message_tasks[pos]);
-                const c = &self.consumers.items[pos];
-                std.debug.print("Start writing to consumer port {}\n", .{c.port});
-                // Internal for write
-                var write_buffer: [1024]u8 = undefined;
-                var stream_wr = c.stream.writer(io, &write_buffer);
-                message_util.writeMessageToStream(&stream_wr, message) catch |err| {
-                    // Cannot write somehow
-                    global_err = err;
-                    c.stream_state = 1;
-                    return;
-                };
-                // Internal for read: Have to read back the R_PCM
-                var read_buffer: [1024]u8 = undefined;
-                var stream_rd = c.stream.reader(io, &read_buffer);
-                const response = message_util.readMessageFromStream(&stream_rd) catch |err| {
-                    // Cannot read back
-                    global_err = err;
-                    c.stream_state = 1;
-                    return;
-                };
-                if (response != null) {
-                    if (response.?.R_PCM == 0) {
-                        std.debug.print("Got a R_PCM ack back from {}\n", .{c.port});
-                        self.ready_lock.unlock();
-                        // Spawn a task to process ready message again.
-                        const task = try io.async(message_util.readMessageFromStreamPutQueue, .{ io, &stream_rd, self.ready_pos_message_queue });
-                        self.ready_pos_message_tasks[pos] = task;
-                        return; // Written to one of them, done.
-                    }
-                } else {
-                    // TODO: Process error here
-                    self.ready_lock.unlock();
-                    return;
-                }
-            },
-            else => {},
-        }
     }
 
     pub fn processReadyMessageFromConsumer(self: *CGroup, io: std.Io, c: *consumer.ConsumerData) !void {

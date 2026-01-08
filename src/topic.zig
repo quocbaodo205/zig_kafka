@@ -40,44 +40,16 @@ pub const Topic = struct {
         std.debug.print("Added a consumer group: port = {}, topic = {} with offset 0\n", .{ cgroup_id, self.topic_id });
     }
 
-    /// Push a new message to be consumed
-    pub fn addAsyncMessage(self: *Self, io: std.Io, message_task: *message_util.message_future) void {
-        // await and parse
-        const message = message_task.await(io) catch {
-            self.mq_lock.unlock(); // Release
-            @panic("Read error");
-        };
-        self.mq_lock.lock(); // Block until acquire
-        switch (message.?) {
-            message_util.MessageType.PCM => |*pcm| {
-                while (!self.mq.push_back(pcm)) {
-                    self.mq_lock.unlock(); // Release
-                    std.Io.sleep(io, .fromSeconds(1), .awake) catch {
-                        @panic("Cannot sleep!");
-                    };
-                    self.mq_lock.lock(); // Block until acquire
-                }
-                self.mq_lock.unlock(); // Release
-            },
-            else => {
-                self.mq_lock.unlock(); // Release
-                return;
-            },
-        }
-    }
-
     /// Push new messages to be consumed
-    pub fn addMessageMulti(self: *Self, io: std.Io, messages: []*message_util.ProduceConsumeMessage) void {
+    pub fn addMessage(self: *Self, io: std.Io, message: *message_util.ProduceConsumeMessage) void {
         self.mq_lock.lock(); // Block until acquire
         // Put all messages there.
-        for (messages) |message| {
-            while (!self.mq.push_back(message)) {
-                self.mq_lock.unlock(); // Release
-                std.Io.sleep(io, .fromSeconds(1), .awake) catch {
-                    @panic("Cannot sleep!");
-                };
-                self.mq_lock.lock(); // Block until acquire
-            }
+        while (!self.mq.push_back(message)) {
+            self.mq_lock.unlock(); // Release
+            std.Io.sleep(io, .fromSeconds(1), .awake) catch {
+                @panic("Cannot sleep!");
+            };
+            self.mq_lock.lock(); // Block until acquire
         }
         self.mq_lock.unlock(); // Release
     }
