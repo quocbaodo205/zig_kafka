@@ -2,11 +2,13 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const net = Io.net;
+const iou = std.os.linux.IoUring;
+
 const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
 const topic = @import("topic.zig");
 const producer = @import("producer.zig");
-const iou = std.os.linux.IoUring;
+const consumer = @import("consumer.zig");
 
 const ADMIN_PORT: u16 = 10000;
 
@@ -24,16 +26,16 @@ pub const KAdmin = struct {
     // A list of producer.
     producers: std.ArrayList(producer.ProducerData),
 
-    // 3 rings:
-    admin_messages_ring: iou,
-    producer_messages_ring: iou,
-    producer_messages_buffer_group: iou.BufferGroup,
-    all_consumers_ring: iou,
+    aring: *iou,
+    pring: *iou,
+    cring: *iou,
+    pbg: *iou.BufferGroup,
+    cbg: *iou.BufferGroup,
 
     /// Init accept a buffer that will be used for all allocation and processing.
-    pub fn init(gpa: Allocator) !Self {
+    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
-        var s = Self{
+        return Self{
             .admin_address = address,
             .read_buffer = undefined,
             .write_buffer = undefined,
@@ -43,29 +45,28 @@ pub const KAdmin = struct {
             // Producer storage init
             .producers = try std.ArrayList(producer.ProducerData).initCapacity(gpa, 10),
             // Ring init
-            .admin_messages_ring = try iou.init(1 << 7, 0),
-            .producer_messages_ring = try iou.init(1 << 7, 0),
-            .producer_messages_buffer_group = undefined,
-            .all_consumers_ring = try iou.init(1 << 7, 0),
+            .aring = aring,
+            .pring = pring,
+            .cring = cring,
+            .pbg = pbg,
+            .cbg = cbg,
         };
-        s.producer_messages_buffer_group = try iou.BufferGroup.init(s.producer_messages_ring, gpa, 1, 1024, 1 << 3);
-        return s;
     }
 
     /// Main function to start an admin server and wait for a message
-    pub fn startAdminServer(self: *Self, io: Io, gpa: Allocator, group: Io.Group) !void {
+    pub fn startAdminServer(self: *Self, io: Io, gpa: Allocator) !void {
         // Create a server on the address and wait for a connection
         var server = try self.admin_address.listen(io, .{ .reuse_address = true }); // TCP server
 
-        // io_uring
-        _ = try self.admin_messages_ring.accept_multishot(0, server.socket.handle, &null, null, 0);
-        _ = try self.admin_messages_ring.submit();
+        // io_uring accept
+        _ = try self.aring.accept_multishot(0, server.socket.handle, &null, null, 0);
+        _ = try self.aring.submit();
 
         // Event loop to process admin accept
         // Use inline completion since these messages are supposed to be quick.
         // Also don't have to batch, these are very short and fast.
         while (true) {
-            const comp_entry = try self.admin_messages_ring.copy_cqe();
+            const comp_entry = try self.aring.copy_cqe();
 
             const err = comp_entry.err();
             if (err == .SUCCESS) {
@@ -80,7 +81,7 @@ pub const KAdmin = struct {
                     var stream_wr = stream.writer(io, &self.write_buffer);
                     // Read and process message
                     if (try message_util.readMessageFromStream(&stream_rd)) |message| {
-                        if (try self.processAdminMessage(io, gpa, group, message)) |response_message| {
+                        if (try self.processAdminMessage(io, gpa, message)) |response_message| {
                             try message_util.writeMessageToStream(&stream_wr, response_message);
                         }
                     }
@@ -129,7 +130,7 @@ pub const KAdmin = struct {
     }
 
     /// Parse a message and call the correct processing function
-    fn processAdminMessage(self: *Self, io: Io, gpa: Allocator, group: *Io.Group, message: message_util.Message) !?message_util.Message {
+    fn processAdminMessage(self: *Self, io: Io, gpa: Allocator, message: message_util.Message) !?message_util.Message {
         switch (message) {
             message_util.MessageType.ECHO => |echo_message| {
                 const response_data = try self.processEchoMessage(gpa, echo_message);
@@ -138,13 +139,13 @@ pub const KAdmin = struct {
                 };
             },
             message_util.MessageType.P_REG => |producer_register_message| {
-                const response = try self.processProducerRegisterMessage(io, gpa, group, &producer_register_message);
+                const response = try self.processProducerRegisterMessage(io, gpa, &producer_register_message);
                 return message_util.Message{
                     .R_P_REG = response,
                 };
             },
             message_util.MessageType.C_REG => |consumer_register_message| {
-                const response = try self.processConsumerRegisterMessage(io, gpa, group, &consumer_register_message);
+                const response = try self.processConsumerRegisterMessage(io, gpa, &consumer_register_message);
                 return message_util.Message{
                     .R_C_REG = response,
                 };
@@ -162,7 +163,7 @@ pub const KAdmin = struct {
     }
 
     // =========================== Producer ======================
-    fn processProducerRegisterMessage(self: *Self, io: std.Io, gpa: Allocator, group: *Io.Group, rm: *const message_util.ProducerRegisterMessage) !u8 {
+    fn processProducerRegisterMessage(self: *Self, io: std.Io, gpa: Allocator, rm: *const message_util.ProducerRegisterMessage) !u8 {
         // Connect to the server and add a stream to the list:
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
         const stream = try address.connect(io, .{ .mode = .stream });
@@ -184,118 +185,85 @@ pub const KAdmin = struct {
                 new_topic,
             );
             const tp = &self.topics.items[self.topics.items.len - 1];
-            // Thread to start popping message from the topic queue
-            try group.concurrent(io, topic.Topic.tryPopMessage, .{ tp, io });
+            // Thread to start popping message from the topic queue. No need to manage.
+            try std.Thread.spawn(.{}, topic.Topic.tryPopMessage, .{ tp, io });
         }
         // Debug print the list of registered producer:
         std.debug.print("Registered a producer on port {}, topic {}\n", .{ rm.port, rm.topic });
         // Upon register, put it to the queue.
-        // TODO: queue an accept multishot here...
         const pd_data = @intFromPtr(pd);
-        _ = try self.producer_messages_buffer_group.recv_multishot(pd_data, stream.socket.handle, 0);
-        _ = try self.producer_messages_ring.submit();
-        // group.concurrent(io, KAdmin.readFromProducer, .{ self, io, pd }) catch {
-        //     @panic("Cannot start reading from producer");
-        // };
+        _ = try self.pbg.recv_multishot(pd_data, stream.socket.handle, 0);
+        _ = try self.pring.submit();
         return 0;
     }
 
-    fn handleProducerMessages(self: *Self, io: Io, gpa: Allocator) void {
-        // Event loop (wait until completion queue has something)
-
-        // Create a buffer of cqe to handle batch read of messages.
-        // Process them in batch
-        var cqes: [1 << 6]std.os.linux.io_uring_cqe = undefined;
+    /// Handle all producer messages in a loop of recv_multishot.
+    /// These messages are supposed to be PCM.
+    pub fn handleProducersLoop(self: *Self, io: Io, gpa: Allocator) !void {
         var write_buf: [1024]u8 = undefined;
-        var topic_messages_map = std.AutoArrayHashMap(u32, *std.ArrayList(message_util.ProduceConsumeMessage)).init(gpa);
+        var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+        var port_data: [65536][]u8 = [_][]u8{undefined} * 65536;
 
+        // Event loop (wait until completion queue has something)
         while (true) {
-            // Will wait until we have an entry.
-            const num_ready = try self.producer_messages_ring.copy_cqes(&cqes, 1);
-            // TODO: Group them by topic to send messages at once for max efficiency.
-            for (cqes[0..num_ready]) |comp_entry| {
-                const err = comp_entry.err();
-                if (err == .SUCCESS) {
-                    const pd: *producer.ProducerData = @ptrFromInt(@as(usize, @intCast(comp_entry.user_data)));
-                    const byte_read: usize = @intCast(comp_entry.res); // The number of byte read.
-                    if (byte_read == 0) {
-                        pd.stream.close(io);
-                        continue;
-                    }
-                    const data_full = try self.producer_messages_ring.get(comp_entry); // Get result for this cqe
-                    // First is #bytes
-                    const data = data_full[1..];
-                    var wr = pd.stream.writer(io, &write_buf);
-                    if (message_util.parseMessage(data)) |m| {
-                        switch (m) {
-                            message_util.MessageType.PCM => |pcm| {
-                                std.debug.print("Received pcm = {s} from pd = {}, message port = {} at {}\n", .{ pcm.message, pd.port, pcm.producer_port, pcm.timestamp });
-                                // TODO: Get the topic and put the message there.
-                                const entry = topic_messages_map.get(pd.topic);
-                                if (entry) |f| {
-                                    f.append(
-                                        gpa,
-                                    );
-                                } else {
-                                    // TODO: Still missing the pd to get the stream and send back...
-                                    // Probably we can use the position instead of the pointer...
-                                    const n = try gpa.create(std.ArrayList(message_util.ProduceConsumeMessage));
-                                    n.* = try std.ArrayList(message_util.ProduceConsumeMessage).initCapacity(gpa, 5);
-                                    try n.append(gpa, pcm);
-                                    topic_messages_map.put(pd.topic, n);
-                                }
-                                const resp = 0;
-                                try message_util.writeMessageToStream(&wr, message_util.Message{
-                                    .R_PCM = resp,
-                                });
-                            },
-                            // Per testing, we will not read back the message we just sent, so all is good.
-                            message_util.MessageType.R_PCM => |resp| {
-                                std.debug.print("Received my own r_pcm = {}\n", .{resp});
-                            },
-                            else => {
-                                // Ignore
-                            },
-                        }
-                    } else {
-                        std.debug.print("No message can be parsed\n", .{});
-                    }
-                } else {
+            // Multi recv, this can comes from multiple stream.
+            const num_recv = try self.pring.copy_cqes(cqes, 1);
+            // Recreate the full data buffer
+            for (cqes[0..num_recv]) |cqe| {
+                const err = cqe.err();
+                if (err != .SUCCESS) {
                     std.debug.print("Err = {any}\n", .{err});
+                    continue;
                 }
+                // User data covert back to a ProducerData pointer, to know which producer it received from.
+                var pd: *producer.ProducerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                const num_read: usize = @intCast(cqe.res);
+                if (num_read == 0) {
+                    pd.stream.close(io);
+                    continue;
+                }
+                const data_full = try self.pbg.get(cqe); // Get result for this cqe
+                // User the port as a way to of storage: each producer port will have a growable buffer that we can just copy data in.
+                const port: usize = @intCast(pd.port);
+                // Copy outside, put it back to kernel after...
+                if (port_data[port] == undefined) {
+                    port_data[port] = std.mem.concat(gpa, u8, .{ "", data_full });
+                } else {
+                    port_data[port] = std.mem.concat(gpa, u8, .{ port_data[port], data_full });
+                }
+                try self.pbg.put(cqe); // Give it back cuz not needed anymore.
+                // Check if the message is good to be processed.
+                const need_len: usize = @as(usize, @intCast(port_data[port][0])) + 1;
+                if (port_data[port].len != need_len) {
+                    continue;
+                }
+                // Good to be parsed. Ignore the length first byte.
+                if (message_util.parseMessage(port_data[port][1..])) |m| {
+                    switch (m) {
+                        message_util.MessageType.PCM => |pcm| {
+                            const res = try self.processPCM(io, &pcm, pd);
+                            var wr = pd.stream.writer(io, &write_buf);
+                            try message_util.writeMessageToStream(&wr, message_util.Message{
+                                .R_PCM = res,
+                            });
+                        },
+                        else => {
+                            // Not supported
+                            std.debug.print("Not supported message of other type\n", .{});
+                        },
+                    }
+                }
+                // Make undefined again.
+                port_data[port] = undefined;
             }
         }
     }
 
-    /// Read from a connected producer at index.
-    fn readFromProducer(self: *Self, io: std.Io, pd: *producer.ProducerData) void {
-        std.debug.print("Start reading from producer with port {}\n", .{pd.port});
-        // Use the registered stream.
-        var stream_read_buff: [1024]u8 = undefined;
-        var stream_write_buff: [1024]u8 = undefined;
-        var stream_rd = pd.stream.reader(io, &stream_read_buff);
-        var stream_wr = pd.stream.writer(io, &stream_write_buff);
-        // Read from the stream: Blocking until the stream is closed.
-        while (true) {
-            var read_task = message_util.readMessageFromStreamAsync(io, &stream_rd);
-            const put_res = self.processAsyncPCM(io, &read_task, pd) catch {
-                @panic("Cannot process message correctly...");
-            };
-            message_util.writeMessageToStream(&stream_wr, message_util.Message{
-                .R_PCM = put_res,
-            }) catch {
-                @panic("Cannot write to stream");
-            };
-        }
-        std.debug.print("Producer on port {} is gone\n", .{pd.port});
-    }
-
-    /// Pretty sure it's gonna be PCM...
-    fn processAsyncPCM(self: *Self, io: std.Io, message_task: *message_util.message_future, pd: *producer.ProducerData) !u8 {
+    fn processPCM(self: *Self, io: std.Io, message: *message_util.ProduceConsumeMessage, pd: *producer.ProducerData) !u8 {
         // Send this message to the correct topic
         for (self.topics.items) |*tp| {
             if (tp.topic_id == pd.topic) {
-                tp.addAsyncMessage(io, message_task);
+                tp.addMessage(io, message);
                 return 0;
             }
         }
@@ -305,7 +273,7 @@ pub const KAdmin = struct {
     // ============================= Consumer ============================
 
     /// Return the position of the consumer in the list
-    fn processConsumerRegisterMessage(self: *Self, io: Io, gpa: Allocator, group: *Io.Group, rm: *const message_util.ConsumerRegisterMessage) !u8 {
+    fn processConsumerRegisterMessage(self: *Self, io: Io, gpa: Allocator, rm: *const message_util.ConsumerRegisterMessage) !u8 {
         // Check if topic exist
         var exist = false;
         var tp: *topic.Topic = undefined;
@@ -336,11 +304,76 @@ pub const KAdmin = struct {
         if (!exist) {
             try tp.addNewCGroup(gpa, rm.group_id, rm.topic);
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
-            // After start, can start advancing right away:
-            try group.concurrent(io, topic.Topic.advanceConsumerGroup, .{ tp, io, cg });
         }
         // Add the port, stream and stream_state
         const pos = try cg.addConsumer(io, gpa, rm.port, stream);
+        const cd = &cg.consumers.items[pos];
+        // Each consumer will send a ready to start receiving messages. This is just 1 byte.
+        const cd_data = @intFromPtr(cd);
+        _ = try self.cbg.recv_multishot(cd_data, consumer.stream.socket.handle, 0);
+        _ = try self.cring.submit();
         return pos;
+    }
+
+    /// Handle all consumer messages in a loop of recv_multishot.
+    /// These are expected to be C_RD only.
+    pub fn handleConsumersLoop(self: *KAdmin, io: Io) !void {
+        var write_buf: [1024]u8 = undefined;
+        var read_buf: [1024]u8 = undefined;
+        var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+        // Event loop
+        while (true) {
+            // Multi recv, this can comes from multiple stream.
+            const num_recv = try self.pring.copy_cqes(cqes, 1);
+            // Recreate the full data buffer, these are just 1 bytes so no concat need.
+            for (cqes[0..num_recv]) |cqe| {
+                const err = cqe.err();
+                if (err != .SUCCESS) {
+                    std.debug.print("Err = {any}\n", .{err});
+                    continue;
+                }
+                var cd: *consumer.ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                // Upon receive, it's a ready for sure.
+                const num_read: usize = @intCast(cqe.res);
+                if (num_read == 0) {
+                    cd.stream.close(io);
+                    continue;
+                }
+                _ = try self.pbg.get(cqe); // Get result for this cqe
+                try self.pbg.put(cqe); // Give it back cuz not needed anymore.
+                var stream_wr = cd.stream.writer(io, &write_buf);
+                // consumer is ready, first write the ack (blocking)
+                try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+                    .R_C_RD = 0,
+                });
+                // Then write one of the PCM in the topic:
+                for (self.topics.items) |*tp| {
+                    if (tp.topic_id != cd.topic_id) {
+                        continue;
+                    }
+                    for (tp.cgroups.items) |*cg| {
+                        if (cg.group_id != cd.group_id) {
+                            continue;
+                        }
+                        // Topic and group is here.
+                        // - Lock and peek the topic to get PCM
+                        tp.mq_lock.lock();
+                        if (tp.mq.peek(cg.offset)) |m| {
+                            // Write message to the stream
+                            try message_util.writeMessageToStream(&stream_wr, m);
+                            // Read back the ack.
+                            var stream_rd = cd.stream.reader(io, &read_buf);
+                            if (try message_util.readMessageFromStream(&stream_rd)) |response| {
+                                if (response.R_PCM == 0) {
+                                    std.debug.print("Got a R_PCM ack back from {}\n", .{cd.port});
+                                }
+                            }
+                            cg.offset += 1;
+                        }
+                        tp.mq_lock.unlock();
+                    }
+                }
+            }
+        }
     }
 };
