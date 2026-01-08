@@ -79,7 +79,7 @@ pub const ProducerProcess = struct {
                 .timestamp = ts,
             },
         });
-        std.debug.print("Written Ping from {}\n", .{self.port});
+        std.debug.print("Written {s} at {}\n", .{ message, ts });
         // Read back response echo message
         if (try message_util.readMessageFromStream(&stream_rd)) |m| {
             std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});
@@ -88,18 +88,5 @@ pub const ProducerProcess = struct {
 
     pub fn close(self: *Self) void {
         self.stream.close();
-    }
-};
-
-pub const ProducerData = struct {
-    const Self = @This();
-
-    topic: u32,
-    port: u16,
-    stream: net.Stream,
-    stream_state: u8,
-
-    pub fn new(topic: u32, port: u16, stream: net.Stream, stream_state: u8) Self {
-        return Self{ .topic = topic, .port = port, .stream = stream, .stream_state = stream_state };
     }
 };
