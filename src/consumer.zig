@@ -12,7 +12,6 @@ pub const ConsumerProcess = struct {
     group_id: u32,
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
-    position: u8,
 
     // Local var after creating a TCP server
     server: net.Server,
@@ -27,7 +26,6 @@ pub const ConsumerProcess = struct {
             .write_buffer = undefined,
             .server = undefined,
             .stream = undefined,
-            .position = undefined,
         };
     }
 
@@ -42,7 +40,7 @@ pub const ConsumerProcess = struct {
         std.debug.print("Sent to server the port: {}, topic: {}, group_id: {}\n", .{ self.port, self.topic, self.group_id });
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .C_REG = message_util.ConsumerRegisterMessage{
-                .topic = self.topic,
+                .topic_id = self.topic,
                 .port = self.port,
                 .group_id = self.group_id,
             },
@@ -50,7 +48,6 @@ pub const ConsumerProcess = struct {
         // Try to read back the response from kadmin
         if (try message_util.readMessageFromStream(&stream_rd)) |res| {
             std.debug.print("Received ACK from server: {}\n", .{res.R_C_REG});
-            self.position = res.R_C_REG;
         }
         // Stream should be closed by the kadmin, no need to close ourselve.
     }
@@ -76,7 +73,7 @@ pub const ConsumerProcess = struct {
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Send the ready message
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-            .C_RD = self.position,
+            .C_RD = {},
         });
         std.debug.print("Sent ready to kadmin for consumer on port {}\n", .{self.port});
         // Read ACK message
@@ -92,37 +89,14 @@ pub const ConsumerProcess = struct {
         var stream_rd = self.stream.reader(io, &self.read_buffer);
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Read PCM message
+        // TODO: Sometime the consumer just cannot get the message.
+        // Usually it's after interupt, probably the stream is still doing some random stuff??
         if (try message_util.readMessageFromStream(&stream_rd)) |message| {
-            // Debug print
             std.debug.print("Receive message {s} from producer {} at ts = {}\n", .{ message.PCM.message, message.PCM.producer_port, message.PCM.timestamp });
             // Write response message
             try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-                .R_PCM = 0,
+                .R_C_PCM = {},
             });
         }
-    }
-
-    pub fn close(self: *Self) void {
-        self.server.stream.close();
-    }
-};
-
-pub const ConsumerData = struct {
-    const Self = @This();
-
-    port: u16,
-    group_id: u32,
-    topic_id: u32,
-    stream: net.Stream,
-    stream_state: u8,
-
-    pub fn new(port: u16, group_id: u32, topic_id: u32, stream: net.Stream, stream_state: u8) Self {
-        return Self{
-            .port = port,
-            .stream = stream,
-            .stream_state = stream_state,
-            .group_id = group_id,
-            .topic_id = topic_id,
-        };
     }
 };

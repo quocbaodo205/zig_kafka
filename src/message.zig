@@ -15,6 +15,7 @@ pub const MessageType = enum(u8) {
     R_C_REG = 103,
     R_PCM = 104,
     R_C_RD = 105,
+    R_C_PCM = 106,
 };
 
 pub const ProducerRegisterMessage = struct {
@@ -43,7 +44,7 @@ pub const ProducerRegisterMessage = struct {
 
 pub const ConsumerRegisterMessage = struct {
     port: u16,
-    topic: u32,
+    topic_id: u32,
     group_id: u32,
 
     const Self = @This();
@@ -57,14 +58,14 @@ pub const ConsumerRegisterMessage = struct {
         // Next 4 bytes is the group_id
         const group_id: u32 = std.mem.readInt(u32, data[6..10], .big);
         return ConsumerRegisterMessage{
-            .topic = topic,
+            .topic_id = topic,
             .port = port,
             .group_id = group_id,
         };
     }
 
     pub fn convertToBytes(self: *const Self, buffer: []u8) ![]u8 {
-        std.mem.writeInt(u32, buffer[0..4], self.topic, .big);
+        std.mem.writeInt(u32, buffer[0..4], self.topic_id, .big);
         std.mem.writeInt(u16, buffer[4..6], self.port, .big);
         std.mem.writeInt(u32, buffer[6..10], self.group_id, .big);
         return buffer[0..10];
@@ -106,12 +107,13 @@ pub const Message = union(MessageType) {
     P_REG: ProducerRegisterMessage,
     C_REG: ConsumerRegisterMessage,
     PCM: ProduceConsumeMessage,
-    C_RD: u8, // Just a byte
+    C_RD: void, // Nothing...
     R_ECHO: []u8, // Echo back the message
     R_P_REG: u8, // Just return a number as ack
     R_C_REG: u8, // Just return a number as ack
-    R_PCM: u8, // Just return a number as ack upon sent / receive
+    R_PCM: u8, // Ack...
     R_C_RD: u8, // Just ack
+    R_C_PCM: void, // Consumer ack the PCM, empty
 };
 
 pub const message_future =
@@ -144,10 +146,13 @@ pub fn parseMessage(message: []u8) ?Message {
             return Message{ .R_PCM = message[1] };
         },
         @intFromEnum(MessageType.C_RD) => {
-            return Message{ .C_RD = message[1] };
+            return Message{ .C_RD = {} };
         },
         @intFromEnum(MessageType.R_C_RD) => {
             return Message{ .R_PCM = message[1] };
+        },
+        @intFromEnum(MessageType.R_C_PCM) => {
+            return Message{ .R_C_PCM = {} };
         },
         else => {
             // Do nothing here
@@ -197,6 +202,12 @@ fn writeDataToStreamWithType(stream_wr: *net.Stream.Writer, mtype: u8, data: []u
     try stream_wr.interface.flush();
 }
 
+// Just the type, no size, useful for C_RD and R_PCM from consumer (who cares lol)
+fn writeJustTypeToStream(stream_wr: *net.Stream.Writer, mtype: u8) !void {
+    try stream_wr.interface.writeByte(mtype); // Send the type
+    try stream_wr.interface.flush();
+}
+
 /// Write a message to the stream
 pub fn writeMessageToStream(stream_wr: *net.Stream.Writer, message: Message) !void {
     switch (message) {
@@ -230,13 +241,15 @@ pub fn writeMessageToStream(stream_wr: *net.Stream.Writer, message: Message) !vo
             var data: [1]u8 = [1]u8{ack_byte};
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_PCM), &data);
         },
-        MessageType.C_RD => |s| {
-            var buf: [1]u8 = [1]u8{s};
-            try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.C_RD), &buf);
+        MessageType.C_RD => |_| {
+            try writeJustTypeToStream(stream_wr, @intFromEnum(MessageType.C_RD));
         },
         MessageType.R_C_RD => |ack_byte| {
             var data: [1]u8 = [1]u8{ack_byte};
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_C_RD), &data);
+        },
+        MessageType.R_C_PCM => |_| {
+            try writeJustTypeToStream(stream_wr, @intFromEnum(MessageType.R_C_PCM));
         },
     }
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 
 /// Ring buffer with upfront max element it can hold.
 /// Not growable and panic if not work
+/// Only accept pointer type.
 pub fn Queue(comptime T: type, max_n: comptime_int) type {
     return struct {
         arr: [max_n]?T,
@@ -37,13 +38,13 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
         }
 
         /// Push an element to the back of the deque
-        pub fn push_back(self: *Self, element: *const T) bool {
+        pub fn push_back(self: *Self, element: T) bool {
             // Add at r
             if (self.arr[self.r] != null) {
                 return false;
                 // @panic("Array filled and cannot add more element!");
             }
-            self.arr[self.r] = element.*; // Deref to copy inside
+            self.arr[self.r] = element;
             self.r += 1;
             self.len += 1;
             if (self.r >= max_n) self.r = 0;
