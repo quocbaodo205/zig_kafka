@@ -100,6 +100,17 @@ pub const ProduceConsumeMessage = struct {
         @memcpy(buffer[10 .. 10 + message_len], self.message);
         return buffer[0 .. 10 + message_len];
     }
+
+    pub fn convertToBytesWithLengthAndType(self: *const Self, buffer: []u8) ![]u8 {
+        const message_len = self.message.len;
+        std.mem.writeInt(u8, buffer[0..1], @as(u8, @intCast(11 + message_len)), .big); // len
+        std.mem.writeInt(u8, buffer[1..2], @intFromEnum(MessageType.PCM), .big); // type
+
+        std.mem.writeInt(u16, buffer[2..4], self.producer_port, .big);
+        std.mem.writeInt(u64, buffer[4..12], self.timestamp, .big);
+        @memcpy(buffer[12 .. 12 + message_len], self.message);
+        return buffer[0 .. 12 + message_len];
+    }
 };
 
 pub const Message = union(MessageType) {

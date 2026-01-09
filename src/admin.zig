@@ -40,6 +40,13 @@ pub const ConsumerData = struct {
     }
 };
 
+pub const WriteData = struct {
+    full_slice: []u8, // Slice, allocated inside
+    fd: net.Socket.Handle,
+    cur_written: usize,
+    need_written: usize,
+};
+
 pub const KAdmin = struct {
     const Self = @This();
 
@@ -53,11 +60,12 @@ pub const KAdmin = struct {
     aring: *iou,
     pring: *iou,
     cring: *iou,
+    wring: *iou,
     pbg: *iou.BufferGroup,
     cbg: *iou.BufferGroup,
 
     /// Init accept a buffer that will be used for all allocation and processing.
-    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
+    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
         return Self{
             .admin_address = address,
@@ -69,6 +77,7 @@ pub const KAdmin = struct {
             .aring = aring,
             .pring = pring,
             .cring = cring,
+            .wring = wring,
             .pbg = pbg,
             .cbg = cbg,
         };
@@ -185,7 +194,6 @@ pub const KAdmin = struct {
     /// Handle all producer messages in a loop of recv_multishot.
     /// These messages are supposed to be PCM.
     pub fn handleProducersLoop(self: *Self, io: Io, gpa: Allocator) !void {
-        var write_buf: [1024]u8 = undefined;
         var cqes: [4]std.os.linux.io_uring_cqe = undefined;
         // In case messages are split, use this to collect + send.
         var port_data = try gpa.alloc(?[]u8, 65536);
@@ -236,8 +244,7 @@ pub const KAdmin = struct {
                         switch (m) {
                             message_util.MessageType.PCM => |pcm| {
                                 try pd.topic.addMessage(io, gpa, &pcm); // Copy and Block until can add.
-                                var wr = pd.stream.writer(io, &write_buf);
-                                try message_util.writeMessageToStream(&wr, message_util.Message{
+                                try self.writeMessageToFD(gpa, pd.stream.socket.handle, message_util.Message{
                                     .R_PCM = 0,
                                 });
                             },
@@ -329,7 +336,6 @@ pub const KAdmin = struct {
                 if (message_util.parseMessage(data[0..])) |m| {
                     switch (m) {
                         message_util.MessageType.C_RD => |_| {
-                            // std.debug.print("C_RD got from {}\n", .{cd.port});
                             var stream_wr = cd.stream.writer(io, &write_buf);
                             // consumer is ready, first write the ack (blocking)
                             try message_util.writeMessageToStream(&stream_wr, message_util.Message{
@@ -339,9 +345,8 @@ pub const KAdmin = struct {
                             cd.topic.mq_lock.lockShared();
                             // std.debug.print("Got the lock for {}\n", .{cd.port});
                             if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
-                                // Write message to the stream
-                                try message_util.writeMessageToStream(&stream_wr, message_util.Message{ .PCM = pcm.* });
-                                // std.debug.print("Written to stream for port {}\n", .{cd.port});
+                                // Write message to the stream, no wait and just +1
+                                try self.writeMessageToFD(gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
                                 cd.group.offset += 1;
                             }
                             cd.topic.mq_lock.unlockShared();
@@ -357,6 +362,69 @@ pub const KAdmin = struct {
                 }
 
                 try self.cbg.put(cqe); // Give it back cuz not needed anymore.
+            }
+        }
+    }
+
+    // ============================ Write ============================
+
+    /// Write a message using `write` to fd.
+    /// Alloc and put the ptr to the user_data
+    fn writeMessageToFD(self: *KAdmin, gpa: Allocator, fd: net.Socket.Handle, message: message_util.Message) !void {
+        const buf = try gpa.alloc(u8, 1024);
+        const wd = try gpa.create(WriteData);
+        wd.full_slice = buf;
+        switch (message) {
+            message_util.MessageType.PCM => |pcm| {
+                const data = try pcm.convertToBytesWithLengthAndType(buf);
+                wd.fd = fd;
+                wd.cur_written = 0;
+                wd.need_written = data.len;
+                const user_data = @intFromPtr(wd);
+                _ = try self.wring.write(user_data, fd, data, 0);
+                _ = try self.wring.submit();
+            },
+            message_util.MessageType.R_PCM => |ack| {
+                buf[0] = ack;
+                wd.fd = fd;
+                wd.cur_written = 0;
+                wd.need_written = 1;
+                const user_data = @intFromPtr(wd);
+                _ = try self.wring.write(user_data, fd, buf[0..1], 0);
+                _ = try self.wring.submit();
+            },
+            else => {
+                // Not supported.
+            },
+        }
+    }
+
+    /// Event loop to handle all write. These just return a buffer to us for now.
+    /// If you need to handle different type of write, you can create a struct for it.
+    pub fn handleWriteLoop(self: *KAdmin, gpa: Allocator) !void {
+        var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+        // Event loop
+        while (true) {
+            const num_write = try self.wring.copy_cqes(&cqes, 1);
+            // Recreate the full data buffer, these are just 1 bytes so no concat need.
+            for (cqes[0..num_write]) |cqe| {
+                const err = cqe.err();
+                if (err != .SUCCESS) {
+                    std.debug.print("Err = {any}\n", .{err});
+                    continue;
+                }
+                // Free data
+                const wd: *WriteData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                wd.cur_written += @as(usize, @intCast(cqe.res));
+                if (wd.cur_written < wd.need_written) {
+                    std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
+                    // Need to keep writing.
+                    _ = try self.wring.write(cqe.user_data, wd.fd, wd.full_slice, wd.cur_written);
+                    _ = try self.wring.submit();
+                } else {
+                    gpa.free(wd.full_slice);
+                    gpa.destroy(wd);
+                }
             }
         }
     }

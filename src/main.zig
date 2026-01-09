@@ -23,17 +23,20 @@ pub fn initKAdmin() !void {
     var aring = try iou.init(8, 0);
     var pring = try iou.init(8, 0);
     var cring = try iou.init(8, 0);
+    var wring = try iou.init(8, 0);
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
     // Start needed threads for event loops
-    var admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &pbg, &cbg);
+    var admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &pbg, &cbg);
     // try admin.startAdminServer(io, gpa);
     var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa });
     var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa });
     var th3 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa });
+    var th4 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa });
     th.join();
     th2.join();
     th3.join();
+    th4.join();
 }
 
 pub fn initProducer(args: []const [:0]const u8) !void {
