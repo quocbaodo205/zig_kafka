@@ -35,13 +35,19 @@ pub const ConsumerData = struct {
     group: *cgroup.CGroup,
     topic: *topic.Topic,
     stream: net.Stream,
+    current_timeout: *std.os.linux.kernel_timespec,
 
-    pub fn new(port: u16, group: *cgroup.CGroup, tp: *topic.Topic, stream: net.Stream) Self {
+    pub fn new(gpa: Allocator, port: u16, group: *cgroup.CGroup, tp: *topic.Topic, stream: net.Stream) !Self {
+        // Create a timespec of 10ms
+        const ts = try gpa.create(std.os.linux.kernel_timespec);
+        ts.sec = 0;
+        ts.nsec = 10000000;
         return Self{
             .port = port,
             .stream = stream,
             .group = group,
             .topic = tp,
+            .current_timeout = ts,
         };
     }
 };
@@ -67,11 +73,12 @@ pub const KAdmin = struct {
     pring: *iou,
     cring: *iou,
     wring: *iou,
+    rring: *iou,
     pbg: *iou.BufferGroup,
     cbg: *iou.BufferGroup,
 
     /// Init accept a buffer that will be used for all allocation and processing.
-    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
+    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, rring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
         return Self{
             .admin_address = address,
@@ -84,6 +91,7 @@ pub const KAdmin = struct {
             .pring = pring,
             .cring = cring,
             .wring = wring,
+            .rring = rring,
             .pbg = pbg,
             .cbg = cbg,
         };
@@ -302,12 +310,53 @@ pub const KAdmin = struct {
         }
         // Add the port, stream and stream_state
         const cd = try gpa.create(ConsumerData);
-        cd.* = ConsumerData.new(rm.port, cg, tp, stream);
+        cd.* = try ConsumerData.new(gpa, rm.port, cg, tp, stream);
         // Each consumer will send a ready to start receiving messages. This is just 1 byte.
         const cd_data = @intFromPtr(cd);
         _ = try self.cbg.recv_multishot(cd_data, cd.stream.socket.handle, 0);
         const n = try self.cring.submit();
         std.debug.print("Send {} recv_multishot here to {}\n", .{ n, cd.port });
+    }
+
+    /// Retry for the consumer write PCM
+    pub fn handleRetryLoop(self: *KAdmin, gpa: Allocator) !void {
+        var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+        // Event loop
+        while (true) {
+            const num_recv = try self.rring.copy_cqes(&cqes, 1);
+            for (cqes[0..num_recv]) |cqe| {
+                const err = cqe.err();
+                // A timeout will return .TIME
+                if (err != .TIME) {
+                    std.debug.print("Err in retry = {any}\n", .{err});
+                    continue;
+                }
+                var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
+                    cd.current_timeout.nsec = 10000000;
+                    cd.current_timeout.sec = 0;
+                    cd.topic.mq_lock.lockShared();
+                    // Write message to the stream, no wait and just +1
+                    try self.writeMessageToFD(gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
+                    cd.group.offset += 1;
+                    cd.topic.mq_lock.unlockShared();
+                } else {
+                    // Double the timeout and send to the retry queue
+                    if (cd.current_timeout.sec != 0) {
+                        cd.current_timeout.sec *= 2;
+                    } else {
+                        cd.current_timeout.nsec *= 2;
+                        if (cd.current_timeout.nsec > 1000000000) {
+                            cd.current_timeout.sec += @divTrunc(cd.current_timeout.nsec, 1000000000);
+                            cd.current_timeout.nsec = @rem(cd.current_timeout.nsec, 1000000000);
+                        }
+                    }
+                    // std.debug.print("Consumer port {} is too fast, wait for {}\n", .{ cd.port, cd.current_timeout.sec });
+                    _ = try self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
+                    _ = try self.rring.submit();
+                }
+            }
+        }
     }
 
     /// Handle all consumer messages in a loop of recv_multishot.
@@ -331,6 +380,7 @@ pub const KAdmin = struct {
                 const num_read: usize = @intCast(cqe.res);
                 if (num_read == 0) {
                     cd.stream.close(io);
+                    gpa.destroy(cd.current_timeout);
                     gpa.destroy(cd);
                     continue;
                 }
@@ -341,19 +391,21 @@ pub const KAdmin = struct {
                     switch (m) {
                         message_util.MessageType.R_C_PCM => |_| {
                             // Write the PCM to the consumer
-                            cd.topic.mq_lock.lockShared();
                             // std.debug.print("Got the lock for {}\n", .{cd.port});
-                            // TODO: Broken stuff when read is faster then write: Cannot peak.
                             if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
+                                cd.current_timeout.nsec = 10000000;
+                                cd.current_timeout.sec = 0;
+                                cd.topic.mq_lock.lockShared();
                                 // Write message to the stream, no wait and just +1
                                 try self.writeMessageToFD(gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
                                 cd.group.offset += 1;
+                                cd.topic.mq_lock.unlockShared();
+                            } else {
+                                // Send to the retry queue
+                                _ = try self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
+                                _ = try self.rring.submit();
                             }
-                            cd.topic.mq_lock.unlockShared();
                         },
-                        // message_util.MessageType.R_C_PCM => |_| {
-                        // std.debug.print("R_PCM got from {}\n", .{cd.port});
-                        // },
                         else => {
                             // Not supported
                             std.debug.print("Not supported message of other type that PCM\n", .{});
@@ -366,9 +418,9 @@ pub const KAdmin = struct {
         }
     }
 
-    // ============================ Write ============================
+    // ============================ Write / Send ============================
 
-    /// Write a message using `write` to fd.
+    /// Write a message using `send` to a socket.
     /// Alloc and put the ptr to the user_data
     fn writeMessageToFD(self: *KAdmin, gpa: Allocator, fd: net.Socket.Handle, message: message_util.Message) !void {
         const buf = try gpa.alloc(u8, 1024);
@@ -381,7 +433,7 @@ pub const KAdmin = struct {
                 wd.cur_written = 0;
                 wd.need_written = data.len;
                 const user_data = @intFromPtr(wd);
-                _ = try self.wring.write(user_data, fd, data, 0);
+                _ = try self.wring.send(user_data, fd, data, 0);
                 _ = try self.wring.submit();
             },
             message_util.MessageType.R_PCM => |ack| {
@@ -390,7 +442,7 @@ pub const KAdmin = struct {
                 wd.cur_written = 0;
                 wd.need_written = 1;
                 const user_data = @intFromPtr(wd);
-                _ = try self.wring.write(user_data, fd, buf[0..1], 0);
+                _ = try self.wring.send(user_data, fd, buf[0..1], 0);
                 _ = try self.wring.submit();
             },
             else => {
@@ -415,14 +467,11 @@ pub const KAdmin = struct {
                 }
                 // Free data
                 const wd: *WriteData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                // if (wd.need_written > 1) {
-                // std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
-                // }
                 wd.cur_written += @as(usize, @intCast(cqe.res));
                 if (wd.cur_written < wd.need_written) {
                     std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
                     // Need to keep writing.
-                    _ = try self.wring.write(cqe.user_data, wd.fd, wd.full_slice, wd.cur_written);
+                    _ = try self.wring.send(cqe.user_data, wd.fd, wd.full_slice[wd.cur_written..], 0);
                     _ = try self.wring.submit();
                 } else {
                     gpa.free(wd.full_slice);
