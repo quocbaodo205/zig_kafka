@@ -79,10 +79,10 @@ pub const ProducerProcess = struct {
                 .timestamp = ts,
             },
         });
-        std.debug.print("Written {s} at {}\n", .{ message, ts });
+        // std.debug.print("Written {s} at {}\n", .{ message, ts });
         // Read back response echo message
-        if (try message_util.readMessageFromStream(&stream_rd)) |m| {
-            std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});
+        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
+            // std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});
         }
     }
 

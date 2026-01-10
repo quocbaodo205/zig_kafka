@@ -16,9 +16,15 @@ pub const ProducerData = struct {
     topic: *topic.Topic,
     port: u16,
     stream: net.Stream,
+    data_buf: ?[]u8,
 
     pub fn new(tp: *topic.Topic, port: u16, stream: net.Stream) Self {
-        return Self{ .topic = tp, .port = port, .stream = stream };
+        return Self{
+            .topic = tp,
+            .port = port,
+            .stream = stream,
+            .data_buf = null,
+        };
     }
 };
 
@@ -196,8 +202,8 @@ pub const KAdmin = struct {
     pub fn handleProducersLoop(self: *Self, io: Io, gpa: Allocator) !void {
         var cqes: [4]std.os.linux.io_uring_cqe = undefined;
         // In case messages are split, use this to collect + send.
-        var port_data = try gpa.alloc(?[]u8, 65536);
-        @memset(port_data, null);
+        // var port_data = try gpa.alloc(?[]u8, 65536);
+        // @memset(port_data, null);
         // Event loop (wait until completion queue has something)
         while (true) {
             // Multi recv, this can comes from multiple stream.
@@ -211,29 +217,27 @@ pub const KAdmin = struct {
                 }
                 // User data covert back to a ProducerData pointer, to know which producer it received from.
                 var pd: *ProducerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                const port: usize = @intCast(pd.port);
                 const num_read: usize = @intCast(cqe.res);
                 if (num_read == 0) {
                     // Clean up when stream is broken.
                     // TODO: Cancel the recv_multishot.
                     pd.stream.close(io);
-                    gpa.destroy(pd);
-                    if (port_data[port]) |sl| {
+                    if (pd.data_buf) |sl| {
                         gpa.free(sl);
-                        port_data[port] = null;
                     }
+                    gpa.destroy(pd);
                     continue;
                 }
                 const data_full = try self.pbg.get(cqe); // Get result for this cqe
                 // User the port as a way to of storage: each producer port will have a growable buffer that we can just copy data in.
                 // Copy outside, put it back to kernel after...
-                if (port_data[port]) |current_data| {
-                    port_data[port] = try std.mem.concat(gpa, u8, &.{ current_data, data_full });
+                if (pd.data_buf) |current_data| {
+                    pd.data_buf = try std.mem.concat(gpa, u8, &.{ current_data, data_full });
                 } else {
-                    port_data[port] = try std.mem.concat(gpa, u8, &.{ "", data_full });
+                    pd.data_buf = try std.mem.concat(gpa, u8, &.{ "", data_full });
                 }
                 try self.pbg.put(cqe); // Give it back cuz not needed anymore.
-                if (port_data[port]) |cur_data| {
+                if (pd.data_buf) |cur_data| {
                     // Check if the message is good to be processed.
                     const need_len: usize = @as(usize, @intCast(cur_data[0])) + 1;
                     if (cur_data.len != need_len) {
@@ -256,7 +260,7 @@ pub const KAdmin = struct {
                     }
                     // Cleanup and make undefined;
                     gpa.free(cur_data);
-                    port_data[port] = null;
+                    pd.data_buf = null;
                 }
             }
         }
@@ -309,7 +313,7 @@ pub const KAdmin = struct {
     /// Handle all consumer messages in a loop of recv_multishot.
     /// These are expected to be C_RD and R_C_PCM (1 byte only)
     pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator) !void {
-        var write_buf: [1024]u8 = undefined;
+        // var write_buf: [1024]u8 = undefined;
         var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
         // Event loop
         while (true) {
@@ -335,15 +339,11 @@ pub const KAdmin = struct {
                 // Good to be parsed. Ignore the length first byte.
                 if (message_util.parseMessage(data[0..])) |m| {
                     switch (m) {
-                        message_util.MessageType.C_RD => |_| {
-                            var stream_wr = cd.stream.writer(io, &write_buf);
-                            // consumer is ready, first write the ack (blocking)
-                            try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-                                .R_C_RD = 0,
-                            });
-                            // Then write one of the PCM in the topic
+                        message_util.MessageType.R_C_PCM => |_| {
+                            // Write the PCM to the consumer
                             cd.topic.mq_lock.lockShared();
                             // std.debug.print("Got the lock for {}\n", .{cd.port});
+                            // TODO: Broken stuff when read is faster then write: Cannot peak.
                             if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
                                 // Write message to the stream, no wait and just +1
                                 try self.writeMessageToFD(gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
@@ -351,9 +351,9 @@ pub const KAdmin = struct {
                             }
                             cd.topic.mq_lock.unlockShared();
                         },
-                        message_util.MessageType.R_C_PCM => |_| {
-                            // std.debug.print("R_PCM got from {}\n", .{cd.port});
-                        },
+                        // message_util.MessageType.R_C_PCM => |_| {
+                        // std.debug.print("R_PCM got from {}\n", .{cd.port});
+                        // },
                         else => {
                             // Not supported
                             std.debug.print("Not supported message of other type that PCM\n", .{});
@@ -415,6 +415,9 @@ pub const KAdmin = struct {
                 }
                 // Free data
                 const wd: *WriteData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                // if (wd.need_written > 1) {
+                // std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
+                // }
                 wd.cur_written += @as(usize, @intCast(cqe.res));
                 if (wd.cur_written < wd.need_written) {
                     std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
