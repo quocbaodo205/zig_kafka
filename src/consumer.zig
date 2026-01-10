@@ -75,7 +75,7 @@ pub const ConsumerProcess = struct {
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .R_C_PCM = {},
         });
-        std.debug.print("Sent ready to kadmin for consumer on port {}\n", .{self.port});
+        // std.debug.print("Sent ready to kadmin for consumer on port {}\n", .{self.port});
         // Read ACK message
         // if (try message_util.readMessageFromStream(&stream_rd)) |_| {
         //     // Debug print
@@ -93,8 +93,8 @@ pub const ConsumerProcess = struct {
         // After changing producer port to 50000, suddenly very smooth???
         // "watch -n 1 ss --socket=tcp" tp monitor the ss command for tcp to see...
         // Usually it's after interupt, probably the stream is still doing some random stuff??
-        if (try message_util.readMessageFromStream(&stream_rd)) |message| {
-            std.debug.print("Receive message {s} from producer {} at ts = {}\n", .{ message.PCM.message, message.PCM.producer_port, message.PCM.timestamp });
+        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
+            // std.debug.print("Receive message {s} from producer {} at ts = {}\n", .{ message.PCM.message, message.PCM.producer_port, message.PCM.timestamp });
             // Write response message
             try message_util.writeMessageToStream(&stream_wr, message_util.Message{
                 .R_C_PCM = {},

@@ -24,19 +24,22 @@ pub fn initKAdmin() !void {
     var pring = try iou.init(8, 0);
     var cring = try iou.init(8, 0);
     var wring = try iou.init(8, 0);
+    var rring = try iou.init(64, 0); // Allow many retry.
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
     // Start needed threads for event loops
-    var admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &pbg, &cbg);
+    var admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
     // try admin.startAdminServer(io, gpa);
     var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa });
     var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa });
     var th3 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa });
     var th4 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa });
+    var th5 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleRetryLoop, .{ &admin, gpa });
     th.join();
     th2.join();
     th3.join();
     th4.join();
+    th5.join();
 }
 
 pub fn initProducer(args: []const [:0]const u8) !void {
@@ -98,28 +101,28 @@ pub fn initBench() !void {
     const io = threaded.io();
     var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{});
     try io.sleep(.fromSeconds(2), .awake);
-    // var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
-    // try io.sleep(.fromSeconds(1), .awake);
-    // var producer2_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50001, 1, 100 });
-    // try io.sleep(.fromSeconds(1), .awake);
+    var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
+    try io.sleep(.fromSeconds(1), .awake);
+    var producer2_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50001, 1, 100 });
+    try io.sleep(.fromSeconds(1), .awake);
     var producer3_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50002, 2, 100 });
     try io.sleep(.fromSeconds(1), .awake);
-    // var consumer1_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 30000, 1, 1, 200 });
-    // try io.sleep(.fromSeconds(1), .awake);
-    // var consumer2_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 30001, 1, 1, 200 });
-    // try io.sleep(.fromSeconds(1), .awake);
-    // var consumer3_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 31000, 1, 2, 50 });
-    // try io.sleep(.fromSeconds(1), .awake);
+    var consumer1_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 30000, 1, 1, 200 });
+    try io.sleep(.fromSeconds(1), .awake);
+    var consumer2_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 30001, 1, 1, 200 });
+    try io.sleep(.fromSeconds(1), .awake);
+    var consumer3_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 31000, 1, 2, 50 });
+    try io.sleep(.fromSeconds(1), .awake);
     var consumer4_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 40000, 2, 1, 50 });
     try io.sleep(.fromSeconds(1), .awake);
 
     defer admin_th.join();
-    // defer producer1_th.join();
-    // defer producer2_th.join();
+    defer producer1_th.join();
+    defer producer2_th.join();
     defer producer3_th.join();
-    // defer consumer1_th.join();
-    // defer consumer2_th.join();
-    // defer consumer3_th.join();
+    defer consumer1_th.join();
+    defer consumer2_th.join();
+    defer consumer3_th.join();
     defer consumer4_th.join();
 }
 
