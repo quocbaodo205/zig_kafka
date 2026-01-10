@@ -37,7 +37,7 @@ pub const ConsumerProcess = struct {
         // Send register message to kadmin
         var stream_rd = stream.reader(io, &self.read_buffer);
         var stream_wr = stream.writer(io, &self.write_buffer);
-        std.debug.print("Sent to server the port: {}, topic: {}, group_id: {}\n", .{ self.port, self.topic, self.group_id });
+        // std.debug.print("Sent to server the port: {}, topic: {}, group_id: {}\n", .{ self.port, self.topic, self.group_id });
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
             .C_REG = message_util.ConsumerRegisterMessage{
                 .topic_id = self.topic,
@@ -46,8 +46,8 @@ pub const ConsumerProcess = struct {
             },
         });
         // Try to read back the response from kadmin
-        if (try message_util.readMessageFromStream(&stream_rd)) |res| {
-            std.debug.print("Received ACK from server: {}\n", .{res.R_C_REG});
+        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
+            // std.debug.print("Received ACK from server: {}\n", .{res.R_C_REG});
         }
         // Stream should be closed by the kadmin, no need to close ourselve.
     }
@@ -69,18 +69,18 @@ pub const ConsumerProcess = struct {
     /// Block until the kadmin accept our ready message.
     pub fn sendReadyMessage(self: *Self, io: std.Io) !void {
         // Init the read/write stream.
-        var stream_rd = self.stream.reader(io, &self.read_buffer);
+        // var stream_rd = self.stream.reader(io, &self.read_buffer);
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Send the ready message
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-            .C_RD = {},
+            .R_C_PCM = {},
         });
         std.debug.print("Sent ready to kadmin for consumer on port {}\n", .{self.port});
         // Read ACK message
-        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
-            // Debug print
-            std.debug.print("Admin ack the ready\n", .{});
-        }
+        // if (try message_util.readMessageFromStream(&stream_rd)) |_| {
+        //     // Debug print
+        //     std.debug.print("Admin ack the ready\n", .{});
+        // }
     }
 
     /// Block until we received a PCM message.
@@ -90,6 +90,8 @@ pub const ConsumerProcess = struct {
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Read PCM message
         // TODO: Sometime the consumer just cannot get the message.
+        // After changing producer port to 50000, suddenly very smooth???
+        // "watch -n 1 ss --socket=tcp" tp monitor the ss command for tcp to see...
         // Usually it's after interupt, probably the stream is still doing some random stuff??
         if (try message_util.readMessageFromStream(&stream_rd)) |message| {
             std.debug.print("Receive message {s} from producer {} at ts = {}\n", .{ message.PCM.message, message.PCM.producer_port, message.PCM.timestamp });
