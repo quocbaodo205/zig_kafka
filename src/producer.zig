@@ -86,7 +86,7 @@ pub const ProducerProcess = struct {
         }
     }
 
-    pub fn close(self: *Self) void {
-        self.stream.close();
+    pub fn close(self: *Self, io: std.Io) void {
+        self.stream.close(io);
     }
 };

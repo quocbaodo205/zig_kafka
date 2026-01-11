@@ -101,4 +101,8 @@ pub const ConsumerProcess = struct {
             });
         }
     }
+
+    pub fn close(self: *Self, io: std.Io) void {
+        self.stream.close(io);
+    }
 };

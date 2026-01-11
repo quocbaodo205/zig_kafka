@@ -11,9 +11,30 @@ const posix = std.posix;
 
 const ADMIN_PORT: u16 = 10000;
 
+var admin: kadmin.KAdmin = undefined;
+
+// fn signalHandler(signo: i32) callconv(.c) void {
+//     if (signo == std.os.linux.SIG.INT) {
+//         std.debug.print("SIGINT signal\n", .{});
+//         admin.is_terminated = true;
+//         std.process.exit(0);
+//     }
+// }
+
 pub fn initKAdmin() !void {
     // TODO: Process terminal signal to clean up.
-    const gpa = std.heap.smp_allocator;
+    var dba = std.heap.DebugAllocator(.{ .stack_trace_frames = 100 }).init;
+    const gpa = dba.allocator();
+    // const gpa = std.heap.smp_allocator;
+
+    // var sa = std.os.linux.Sigaction{
+    //     .handler = .{ .handler = signalHandler },
+    //     .mask = std.os.linux.empty_sigset,
+    //     .flags = 0,
+    //     .restorer = null,
+    // };
+
+    // _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
 
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
@@ -28,7 +49,7 @@ pub fn initKAdmin() !void {
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
     // Start needed threads for event loops
-    var admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
+    admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
     // try admin.startAdminServer(io, gpa);
     var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa });
     var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa });
@@ -51,19 +72,22 @@ pub fn initProducer(args: []const [:0]const u8) !void {
 }
 
 pub fn initProducerWithParams(port: u16, topic: u32, delay_ms: i64) !void {
-    const gpa = std.heap.smp_allocator;
+    var dba = std.heap.DebugAllocator(.{}).init;
+    const gpa = dba.allocator();
+    // const gpa = std.heap.smp_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
     var p = try producer.ProducerProcess.init(port, topic);
     try p.startProducerServer(io);
-    // Don't read from stdin anymore! Just run forever!
-    while (true) {
+    // while (true) {
+    // Run 500 times
+    for (0..500) |_| {
         try p.writeMessage(io, try std.fmt.allocPrint(gpa, "Ping from {}", .{port}));
         try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
     }
-    p.close();
+    p.close(io);
 }
 
 pub fn initConsumer(args: []const [:0]const u8) !void {
@@ -75,7 +99,9 @@ pub fn initConsumer(args: []const [:0]const u8) !void {
 }
 
 pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) !void {
-    const gpa = std.heap.smp_allocator;
+    var dba = std.heap.DebugAllocator(.{}).init;
+    const gpa = dba.allocator();
+    // const gpa = std.heap.smp_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
@@ -83,19 +109,22 @@ pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) 
     var c = try consumer.ConsumerProcess.init(port, topic, group);
     try c.startConsumerServer(io);
     // Always try to receive message
-    while (true) {
+    // Run 500 times
+    // while (true) {
+    for (0..500) |_| {
         try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
         try c.sendReadyMessage(io);
         // Super small pause after for no reason???
         // try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
         try c.receiveMessage(io);
     }
-    c.close();
 }
 
 // Bench setup with thread spawn
 pub fn initBench() !void {
-    const gpa = std.heap.smp_allocator;
+    var dba = std.heap.DebugAllocator(.{}).init;
+    const gpa = dba.allocator();
+    // const gpa = std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
