@@ -43,8 +43,8 @@ pub const ProducerProcess = struct {
             },
         });
         // Try to read back the response from kadmin
-        if (try message_util.readMessageFromStream(&stream_rd)) |res| {
-            std.debug.print("Received ACK from server: {}\n", .{res.R_P_REG});
+        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
+            // std.debug.print("Received ACK from server: {}\n", .{res.R_P_REG});
         }
         // Stream should be closed by the kadmin, no need to close ourselve.
     }

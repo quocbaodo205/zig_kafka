@@ -62,17 +62,17 @@ pub const Topic = struct {
     /// Pop mesages for this topic only.
     pub fn tryPopMessage(self: *Self, io: Io, gpa: Allocator) void {
         while (true) {
-            std.Io.sleep(io, .fromSeconds(10), .awake) catch {
+            std.Io.sleep(io, .fromSeconds(5), .awake) catch {
                 return;
             }; // Every 10s
-            std.debug.print("Done sleep, try to get lock and pop...\n", .{});
+            // std.debug.print("Done sleep, try to get lock and pop...\n", .{});
             self.topic_lock.lockShared(); // Need the number of consumer group to be stable
-            std.debug.print("Got the topic lock\n", .{});
+            // std.debug.print("Got the topic lock\n", .{});
             var min_offset: usize = 1000000000;
             for (self.cgroups.items) |*cg| {
                 min_offset = @min(min_offset, cg.offset);
             }
-            std.debug.print("Get to popping in topic {}, min_offset = {}, pop_num = {}\n", .{ self.topic_id, min_offset, self.mq.pop_num });
+            // std.debug.print("Get to popping in topic {}, min_offset = {}, pop_num = {}\n", .{ self.topic_id, min_offset, self.mq.pop_num });
             self.mq_lock.lock(); // Lock to pop
             if (min_offset == 1000000000) {
                 self.mq_lock.unlock();

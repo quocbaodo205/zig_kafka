@@ -21,11 +21,10 @@ var admin: kadmin.KAdmin = undefined;
 //     }
 // }
 
-pub fn initKAdmin() !void {
+pub fn initKAdmin(timeout_s: i64) !void {
     // TODO: Process terminal signal to clean up.
-    var dba = std.heap.DebugAllocator(.{ .stack_trace_frames = 100 }).init;
-    const gpa = dba.allocator();
     // const gpa = std.heap.smp_allocator;
+    const gpa = std.heap.c_allocator;
 
     // var sa = std.os.linux.Sigaction{
     //     .handler = .{ .handler = signalHandler },
@@ -51,16 +50,17 @@ pub fn initKAdmin() !void {
     // Start needed threads for event loops
     admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
     // try admin.startAdminServer(io, gpa);
-    var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa });
-    var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa });
-    var th3 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa });
-    var th4 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa });
-    var th5 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleRetryLoop, .{ &admin, gpa });
+    var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa, timeout_s });
+    var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa, timeout_s });
+    var th3 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa, timeout_s });
+    var th4 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa, timeout_s });
+    var th5 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleRetryLoop, .{ &admin, gpa, timeout_s });
     th.join();
     th2.join();
     th3.join();
     th4.join();
     th5.join();
+    std.debug.print("Everything stop in admin\n", .{});
 }
 
 pub fn initProducer(args: []const [:0]const u8) !void {
@@ -72,7 +72,7 @@ pub fn initProducer(args: []const [:0]const u8) !void {
 }
 
 pub fn initProducerWithParams(port: u16, topic: u32, delay_ms: i64) !void {
-    var dba = std.heap.DebugAllocator(.{}).init;
+    var dba = std.heap.DebugAllocator(.{ .stack_trace_frames = 100, .safety = true }).init;
     const gpa = dba.allocator();
     // const gpa = std.heap.smp_allocator;
     // Set up our I/O implementation.
@@ -81,13 +81,11 @@ pub fn initProducerWithParams(port: u16, topic: u32, delay_ms: i64) !void {
     const io = threaded.io();
     var p = try producer.ProducerProcess.init(port, topic);
     try p.startProducerServer(io);
-    // while (true) {
-    // Run 500 times
-    for (0..500) |_| {
+    while (true) {
         try p.writeMessage(io, try std.fmt.allocPrint(gpa, "Ping from {}", .{port}));
         try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
     }
-    p.close(io);
+    std.debug.print("Producer is done\n", .{});
 }
 
 pub fn initConsumer(args: []const [:0]const u8) !void {
@@ -99,7 +97,7 @@ pub fn initConsumer(args: []const [:0]const u8) !void {
 }
 
 pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) !void {
-    var dba = std.heap.DebugAllocator(.{}).init;
+    var dba = std.heap.DebugAllocator(.{ .stack_trace_frames = 100, .safety = true }).init;
     const gpa = dba.allocator();
     // const gpa = std.heap.smp_allocator;
     // Set up our I/O implementation.
@@ -109,15 +107,37 @@ pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) 
     var c = try consumer.ConsumerProcess.init(port, topic, group);
     try c.startConsumerServer(io);
     // Always try to receive message
-    // Run 500 times
-    // while (true) {
-    for (0..500) |_| {
+    while (true) {
+        // for (0..100) |_| {
         try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
-        try c.sendReadyMessage(io);
-        // Super small pause after for no reason???
-        // try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
-        try c.receiveMessage(io);
+        c.sendReadyMessage(io) catch |err| {
+            std.debug.print("Error sending ready message: {any}\n", .{err});
+            break;
+        };
+        c.receiveMessage(io) catch |err| {
+            std.debug.print("Error receive message: {any}\n", .{err});
+            break;
+        };
     }
+    std.debug.print("Consumer is done\n", .{});
+}
+
+pub fn initMemory() !void {
+    var dba = std.heap.DebugAllocator(.{ .safety = true }).init;
+    const gpa = dba.allocator();
+    // const gpa = std.heap.c_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{20});
+    try io.sleep(.fromSeconds(2), .awake);
+    var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
+    try io.sleep(.fromSeconds(1), .awake);
+    var consumer1_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 30000, 1, 1, 200 });
+
+    admin_th.join();
+    producer1_th.join();
+    consumer1_th.join();
 }
 
 // Bench setup with thread spawn
@@ -128,7 +148,7 @@ pub fn initBench() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
-    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{});
+    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{15});
     try io.sleep(.fromSeconds(2), .awake);
     var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
     try io.sleep(.fromSeconds(1), .awake);
@@ -145,14 +165,14 @@ pub fn initBench() !void {
     var consumer4_th = try std.Thread.spawn(.{}, initConsumerWithParams, .{ 40000, 2, 1, 50 });
     try io.sleep(.fromSeconds(1), .awake);
 
-    defer admin_th.join();
-    defer producer1_th.join();
-    defer producer2_th.join();
-    defer producer3_th.join();
-    defer consumer1_th.join();
-    defer consumer2_th.join();
-    defer consumer3_th.join();
-    defer consumer4_th.join();
+    admin_th.join();
+    producer1_th.join();
+    producer2_th.join();
+    producer3_th.join();
+    consumer1_th.join();
+    consumer2_th.join();
+    consumer3_th.join();
+    consumer4_th.join();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -162,13 +182,15 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("arg: {s}", .{arg});
     }
     if (std.mem.eql(u8, args[1], "server")) {
-        try initKAdmin();
+        try initKAdmin(100);
     } else if (std.mem.eql(u8, args[1], "producer")) {
         try initProducer(args);
     } else if (std.mem.eql(u8, args[1], "consumer")) {
         try initConsumer(args);
     } else if (std.mem.eql(u8, args[1], "bench")) {
         try initBench();
+    } else if (std.mem.eql(u8, args[1], "mem")) {
+        try initMemory();
     } else {
         // TODO: Init other type of process
     }

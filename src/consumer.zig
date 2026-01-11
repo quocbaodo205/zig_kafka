@@ -89,10 +89,6 @@ pub const ConsumerProcess = struct {
         var stream_rd = self.stream.reader(io, &self.read_buffer);
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Read PCM message
-        // TODO: Sometime the consumer just cannot get the message.
-        // After changing producer port to 50000, suddenly very smooth???
-        // "watch -n 1 ss --socket=tcp" tp monitor the ss command for tcp to see...
-        // Usually it's after interupt, probably the stream is still doing some random stuff??
         if (try message_util.readMessageFromStream(&stream_rd)) |_| {
             // std.debug.print("Receive message {s} from producer {} at ts = {}\n", .{ message.PCM.message, message.PCM.producer_port, message.PCM.timestamp });
             // Write response message
