@@ -46,10 +46,13 @@ pub fn initKAdmin(timeout_s: i64) !void {
     var wring = try iou.init(8, 0);
     var rring = try iou.init(64, 0); // Allow many retry.
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
+    defer pbg.deinit(gpa);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
+    defer cbg.deinit(gpa);
     // Start needed threads for event loops
     admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
-    // try admin.startAdminServer(io, gpa);
+    defer admin.stream_list.deinit(gpa);
+    defer admin.topics.deinit(gpa);
     var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa, timeout_s });
     var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa, timeout_s });
     var th3 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa, timeout_s });
@@ -148,7 +151,7 @@ pub fn initBench() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
-    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{15});
+    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{60});
     try io.sleep(.fromSeconds(2), .awake);
     var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
     try io.sleep(.fromSeconds(1), .awake);

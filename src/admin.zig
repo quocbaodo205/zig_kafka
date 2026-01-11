@@ -222,6 +222,7 @@ pub const KAdmin = struct {
             );
             topic_o = &self.topics.items[self.topics.items.len - 1];
             // Thread to start popping message from the topic queue. No need to manage.
+            // TODO: No join -> run away thread...
             _ = try std.Thread.spawn(.{}, topic.Topic.tryPopMessage, .{ topic_o.?, io, gpa });
         }
         if (topic_o) |tp| {
@@ -295,7 +296,10 @@ pub const KAdmin = struct {
                 // User the port as a way to of storage: each producer port will have a growable buffer that we can just copy data in.
                 // Copy outside, put it back to kernel after...
                 if (pd.data_buf) |current_data| {
+                    // Memory is lost here...
+                    const old_buf = current_data;
                     pd.data_buf = try std.mem.concat(gpa, u8, &.{ current_data, data_full });
+                    gpa.free(old_buf);
                 } else {
                     pd.data_buf = try std.mem.concat(gpa, u8, &.{ "", data_full });
                 }
@@ -321,7 +325,7 @@ pub const KAdmin = struct {
                         }
                     }
                     // Cleanup and make undefined;
-                    // gpa.free(cur_data);
+                    gpa.free(cur_data);
                     pd.data_buf = null;
                 }
             }
