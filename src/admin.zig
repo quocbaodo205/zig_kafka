@@ -99,6 +99,52 @@ pub const KAdmin = struct {
         };
     }
 
+    /// Write the current state to file as a way of persistent.
+    /// Call when the state changed, like adding a new topic or adding a consumer group.
+    pub fn writeOverallStateToFile(self: *Self, io: Io) !void {
+        const f = try Io.Dir.openFile(Io.Dir.cwd(), io, "overall_state", .{ .mode = .write_only });
+        defer f.close(io); // Persist by close
+        var buf: [10240]u8 = undefined; // Big buffer
+        var wr = f.writer(io, &buf);
+        try wr.seekTo(0); // Write at 0
+        // Format: First number is the number of topic
+        try wr.interface.writeInt(u16, @as(u16, @intCast(self.topics.items.len)), .big);
+        for (self.topics.items) |tp| {
+            // Next 2 numbers are topic id and #cgroup
+            try wr.interface.writeInt(u32, tp.topic_id, .big);
+            try wr.interface.writeInt(u16, @as(u16, @intCast(tp.cgroups.items.len)), .big);
+            // Following is all the cgroup_id
+            for (tp.cgroups.items) |cg| {
+                try wr.interface.writeInt(u32, cg.group_id, .big);
+            }
+        }
+        try wr.flush(); // Flush at once in the end
+    }
+
+    /// Read back the current overall state from disk into the `KAdmin` structure.
+    /// Can be use after an init.
+    pub fn readOverallStateFromFile(self: *Self, io: Io, gpa: Allocator) !void {
+        const f = try Io.Dir.openFile(Io.Dir.cwd(), io, "overall_state", .{ .mode = .read_only });
+        defer f.close(io);
+        var buf: [10240]u8 = undefined;
+        var rd = f.reader(io, &buf);
+        const num_topic: u16 = try rd.interface.takeInt(u16, .big);
+        // Clean up current topics
+        self.topics.clearRetainingCapacity();
+        for (0..num_topic) |_| {
+            // Create a new topic and push it
+            const topic_id: u32 = try rd.interface.takeInt(u32, .big);
+            var tp = try topic.Topic.new(gpa, topic_id);
+            const num_cg: u16 = try rd.interface.takeInt(u16, .big);
+            for (0..num_cg) |_| {
+                const group_id: u32 = try rd.interface.takeInt(u32, .big);
+                // Offset = 0, will read the offset from another file
+                tp.addNewCGroup(gpa, group_id);
+            }
+            self.topics.append(gpa, tp);
+        }
+    }
+
     /// Main function to start an admin server and wait for a message
     pub fn startAdminServer(self: *Self, io: Io, group: *Io.Group, gpa: Allocator, timeout_s: i64) void {
         // Anon function
@@ -112,9 +158,7 @@ pub const KAdmin = struct {
                 };
 
                 // io_uring accept
-                _ = t_self.aring.accept_multishot(0, server.socket.handle, null, null, 0) catch |err| {
-                    std.debug.print("{any}", .{err});
-                };
+                _ = try t_self.aring.accept_multishot(0, server.socket.handle, null, null, 0);
                 if (t_timeout_s != 0) {
                     _ = try t_self.aring.timeout(0, &.{
                         .sec = t_timeout_s,
@@ -237,6 +281,8 @@ pub const KAdmin = struct {
                 gpa,
                 new_topic,
             );
+            // Persist to disk
+            try self.writeOverallStateToFile(io);
             topic_o = &self.topics.items[self.topics.items.len - 1];
             try group.concurrent(io, topic.Topic.tryPopMessage, .{ topic_o.?, io, gpa });
         }
@@ -387,6 +433,7 @@ pub const KAdmin = struct {
         }
         if (!exist) {
             try tp.addNewCGroup(gpa, rm.group_id);
+            try self.writeOverallStateToFile(io); //Persist to disk
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
         }
         // Add the port, stream and stream_state

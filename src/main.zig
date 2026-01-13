@@ -33,8 +33,8 @@ pub fn initKAdmin(timeout_s: i64) !void {
 
     // _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
 
-    // const gpa = std.heap.smp_allocator;
-    const gpa = std.heap.c_allocator;
+    const gpa = std.heap.smp_allocator;
+    // const gpa = std.heap.c_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
@@ -146,7 +146,7 @@ pub fn initBench() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
-    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{60});
+    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{120});
     try io.sleep(.fromSeconds(2), .awake);
     var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
     try io.sleep(.fromSeconds(1), .awake);
