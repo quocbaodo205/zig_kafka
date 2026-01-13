@@ -17,6 +17,7 @@ pub const Topic = struct {
     // Sync lock
     mq_lock: std.Thread.RwLock.Impl,
     topic_lock: std.Thread.RwLock.Impl,
+    is_terminated: bool,
 
     pub fn new(gpa: Allocator, topic_id: u32) !Self {
         return Self{
@@ -25,6 +26,7 @@ pub const Topic = struct {
             .cgroups = try std.ArrayList(CGroup).initCapacity(gpa, 10),
             .mq_lock = std.Thread.RwLock.Impl{},
             .topic_lock = std.Thread.RwLock.Impl{},
+            .is_terminated = false,
         };
     }
 
@@ -61,7 +63,7 @@ pub const Topic = struct {
 
     /// Pop mesages for this topic only.
     pub fn tryPopMessage(self: *Self, io: Io, gpa: Allocator) void {
-        while (true) {
+        while (!self.is_terminated) {
             std.Io.sleep(io, .fromSeconds(5), .awake) catch {
                 return;
             }; // Every 10s
@@ -88,6 +90,11 @@ pub const Topic = struct {
             }
             defer self.mq_lock.unlock();
             self.topic_lock.unlockShared(); // Unlock on done loop
+        }
+        // Once terminated, free all remaining messages
+        while (self.mq.pop_front()) |old_data| {
+            gpa.free(old_data.message);
+            gpa.destroy(old_data);
         }
     }
 };

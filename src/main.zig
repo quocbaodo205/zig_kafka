@@ -23,8 +23,6 @@ var admin: kadmin.KAdmin = undefined;
 
 pub fn initKAdmin(timeout_s: i64) !void {
     // TODO: Process terminal signal to clean up.
-    // const gpa = std.heap.smp_allocator;
-    const gpa = std.heap.c_allocator;
 
     // var sa = std.os.linux.Sigaction{
     //     .handler = .{ .handler = signalHandler },
@@ -35,16 +33,24 @@ pub fn initKAdmin(timeout_s: i64) !void {
 
     // _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
 
+    // const gpa = std.heap.smp_allocator;
+    const gpa = std.heap.c_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
+    var group = Io.Group.init;
     // Init all rings and bg
     var aring = try iou.init(8, 0);
+    defer aring.deinit();
     var pring = try iou.init(8, 0);
+    defer pring.deinit();
     var cring = try iou.init(8, 0);
+    defer cring.deinit();
     var wring = try iou.init(8, 0);
+    defer wring.deinit();
     var rring = try iou.init(64, 0); // Allow many retry.
+    defer rring.deinit();
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
     defer pbg.deinit(gpa);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
@@ -53,16 +59,12 @@ pub fn initKAdmin(timeout_s: i64) !void {
     admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
     defer admin.stream_list.deinit(gpa);
     defer admin.topics.deinit(gpa);
-    var th = try std.Thread.spawn(.{}, kadmin.KAdmin.startAdminServer, .{ &admin, io, gpa, timeout_s });
-    var th2 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa, timeout_s });
-    var th3 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa, timeout_s });
-    var th4 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa, timeout_s });
-    var th5 = try std.Thread.spawn(.{}, kadmin.KAdmin.handleRetryLoop, .{ &admin, gpa, timeout_s });
-    th.join();
-    th2.join();
-    th3.join();
-    th4.join();
-    th5.join();
+    try group.concurrent(io, kadmin.KAdmin.startAdminServer, .{ &admin, io, &group, gpa, timeout_s });
+    try group.concurrent(io, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa, timeout_s });
+    try group.concurrent(io, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa, timeout_s });
+    try group.concurrent(io, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa, timeout_s });
+    try group.concurrent(io, kadmin.KAdmin.handleRetryLoop, .{ &admin, gpa, timeout_s });
+    try group.await(io);
     std.debug.print("Everything stop in admin\n", .{});
 }
 
@@ -75,9 +77,7 @@ pub fn initProducer(args: []const [:0]const u8) !void {
 }
 
 pub fn initProducerWithParams(port: u16, topic: u32, delay_ms: i64) !void {
-    var dba = std.heap.DebugAllocator(.{ .stack_trace_frames = 100, .safety = true }).init;
-    const gpa = dba.allocator();
-    // const gpa = std.heap.smp_allocator;
+    const gpa = std.heap.smp_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
@@ -100,9 +100,7 @@ pub fn initConsumer(args: []const [:0]const u8) !void {
 }
 
 pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) !void {
-    var dba = std.heap.DebugAllocator(.{ .stack_trace_frames = 100, .safety = true }).init;
-    const gpa = dba.allocator();
-    // const gpa = std.heap.smp_allocator;
+    const gpa = std.heap.smp_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
@@ -126,9 +124,8 @@ pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) 
 }
 
 pub fn initMemory() !void {
-    var dba = std.heap.DebugAllocator(.{ .safety = true }).init;
-    const gpa = dba.allocator();
     // const gpa = std.heap.c_allocator;
+    const gpa = std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
@@ -145,9 +142,7 @@ pub fn initMemory() !void {
 
 // Bench setup with thread spawn
 pub fn initBench() !void {
-    var dba = std.heap.DebugAllocator(.{}).init;
-    const gpa = dba.allocator();
-    // const gpa = std.heap.smp_allocator;
+    const gpa = std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
