@@ -13,25 +13,23 @@ const ADMIN_PORT: u16 = 10000;
 
 var admin: kadmin.KAdmin = undefined;
 
-// fn signalHandler(signo: i32) callconv(.c) void {
-//     if (signo == std.os.linux.SIG.INT) {
-//         std.debug.print("SIGINT signal\n", .{});
-//         admin.is_terminated = true;
-//         std.process.exit(0);
-//     }
-// }
+fn adminSignalHandler(signo: std.os.linux.SIG) callconv(.c) void {
+    if (signo == std.os.linux.SIG.INT) {
+        std.debug.print("SIGINT signal\n", .{});
+        admin.sendCancelSignal() catch {
+            @panic("Cannot send cancel signal");
+        };
+    }
+}
 
-pub fn initKAdmin(timeout_s: i64) !void {
-    // TODO: Process terminal signal to clean up.
+pub fn initKAdmin() !void {
+    var sa = std.os.linux.Sigaction{
+        .handler = .{ .handler = adminSignalHandler },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
 
-    // var sa = std.os.linux.Sigaction{
-    //     .handler = .{ .handler = signalHandler },
-    //     .mask = std.os.linux.empty_sigset,
-    //     .flags = 0,
-    //     .restorer = null,
-    // };
-
-    // _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
+    _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
 
     const gpa = std.heap.smp_allocator;
     // const gpa = std.heap.c_allocator;
@@ -42,30 +40,23 @@ pub fn initKAdmin(timeout_s: i64) !void {
     var group = Io.Group.init;
     // Init all rings and bg
     var aring = try iou.init(8, 0);
-    defer aring.deinit();
     var pring = try iou.init(8, 0);
-    defer pring.deinit();
     var cring = try iou.init(8, 0);
-    defer cring.deinit();
     var wring = try iou.init(8, 0);
-    defer wring.deinit();
     var rring = try iou.init(64, 0); // Allow many retry.
-    defer rring.deinit();
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
-    defer pbg.deinit(gpa);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
-    defer cbg.deinit(gpa);
     // Start needed threads for event loops
     admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
-    defer admin.stream_list.deinit(gpa);
-    defer admin.topics.deinit(gpa);
-    try group.concurrent(io, kadmin.KAdmin.startAdminServer, .{ &admin, io, &group, gpa, timeout_s });
-    try group.concurrent(io, kadmin.KAdmin.handleProducersLoop, .{ &admin, io, gpa, timeout_s });
-    try group.concurrent(io, kadmin.KAdmin.handleConsumersLoop, .{ &admin, io, gpa, timeout_s });
-    try group.concurrent(io, kadmin.KAdmin.handleWriteLoop, .{ &admin, gpa, timeout_s });
-    try group.concurrent(io, kadmin.KAdmin.handleRetryLoop, .{ &admin, gpa, timeout_s });
+    defer admin.deinit(gpa);
+    try group.concurrent(io, kadmin.KAdmin.startAdminServer, .{ &admin, io, &group, gpa });
+    try group.concurrent(io, kadmin.handleProducersLoop, .{ &admin, io, gpa });
+    try group.concurrent(io, kadmin.handleConsumersLoop, .{ &admin, io, gpa });
+    try group.concurrent(io, kadmin.handleWriteLoop, .{ &admin, gpa });
+    try group.concurrent(io, kadmin.handleRetryLoop, .{ &admin, gpa });
     try group.await(io);
     std.debug.print("Everything stop in admin\n", .{});
+    std.process.exit(0); // Terminate everything else
 }
 
 pub fn initProducer(args: []const [:0]const u8) !void {
@@ -129,7 +120,7 @@ pub fn initMemory() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
-    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{20});
+    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{});
     try io.sleep(.fromSeconds(2), .awake);
     var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
     try io.sleep(.fromSeconds(1), .awake);
@@ -146,7 +137,7 @@ pub fn initBench() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
-    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{120});
+    var admin_th = try std.Thread.spawn(.{}, initKAdmin, .{});
     try io.sleep(.fromSeconds(2), .awake);
     var producer1_th = try std.Thread.spawn(.{}, initProducerWithParams, .{ 50000, 1, 100 });
     try io.sleep(.fromSeconds(1), .awake);
@@ -180,7 +171,7 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("arg: {s}", .{arg});
     }
     if (std.mem.eql(u8, args[1], "server")) {
-        try initKAdmin(100);
+        try initKAdmin();
     } else if (std.mem.eql(u8, args[1], "producer")) {
         try initProducer(args);
     } else if (std.mem.eql(u8, args[1], "consumer")) {

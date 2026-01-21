@@ -2,7 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const net = Io.net;
-const iou = std.os.linux.IoUring;
+const linux = std.os.linux;
+const iou = linux.IoUring;
 
 const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
@@ -146,10 +147,10 @@ pub const KAdmin = struct {
     }
 
     /// Main function to start an admin server and wait for a message
-    pub fn startAdminServer(self: *Self, io: Io, group: *Io.Group, gpa: Allocator, timeout_s: i64) void {
+    pub fn startAdminServer(self: *Self, io: Io, group: *Io.Group, gpa: Allocator) void {
         // Anon function
         const temp = struct {
-            pub fn startAdminServer(t_self: *Self, t_io: Io, t_group: *Io.Group, t_gpa: Allocator, t_timeout_s: i64) !void {
+            pub fn startAdminServer(t_self: *Self, t_io: Io, t_group: *Io.Group, t_gpa: Allocator) !void {
                 var cqes: [2]std.os.linux.io_uring_cqe = undefined;
                 // Create a server on the address and wait for a connection
                 var server = t_self.admin_address.listen(t_io, .{ .reuse_address = true }) catch |err| {
@@ -158,20 +159,11 @@ pub const KAdmin = struct {
                 };
 
                 // io_uring accept
-                _ = try t_self.aring.accept_multishot(0, server.socket.handle, null, null, 0);
-                if (t_timeout_s != 0) {
-                    _ = try t_self.aring.timeout(0, &.{
-                        .sec = t_timeout_s,
-                        .nsec = 0,
-                    }, 0, 0);
-                }
-                _ = try t_self.aring.submit();
+                _ = try t_self.aring.accept_multishot(1, server.socket.handle, null, null, 0);
 
                 // Read / write buffer for admin only.
                 var read_buf: [1024]u8 = undefined;
                 var write_buf: [1024]u8 = undefined;
-
-                var terminated = false;
 
                 // Event loop to process admin accept
                 // Use inline completion since these messages are supposed to be quick.
@@ -181,22 +173,18 @@ pub const KAdmin = struct {
                     const num_ready = try t_self.aring.copy_cqes(&cqes, 1);
                     for (cqes[0..num_ready]) |cqe| {
                         const err = cqe.err();
-                        if (err == .TIME) {
-                            if (!terminated) {
-                                terminated = true;
-                                _ = try t_self.aring.timeout(0, &.{
-                                    .sec = 5,
-                                    .nsec = 0,
-                                }, 0, 0);
-                                _ = try t_self.aring.submit();
-                                continue;
-                            } else {
-                                std.debug.print("Shutdown all stream: {} streams\n", .{t_self.stream_list.items.len});
-                                for (t_self.stream_list.items) |stream| {
-                                    try stream.shutdown(t_io, .both);
-                                }
-                                return;
+                        if (cqe.user_data == 0) {
+                            // End it.
+                            std.debug.print("Shutdown all stream: {} streams\n", .{t_self.stream_list.items.len});
+                            for (t_self.stream_list.items) |stream| {
+                                try stream.shutdown(t_io, .both);
                             }
+                            // On done, also set topic states
+                            for (t_self.topics.items) |*tp| {
+                                tp.is_terminated = true;
+                            }
+                            std.debug.print("Terminated admin\n", .{});
+                            return;
                         }
                         if (err == .SUCCESS) {
                             const fd = cqe.res; // The fd for the accepted socket (read / write using it)
@@ -217,16 +205,11 @@ pub const KAdmin = struct {
                         }
                     }
                 }
-                std.debug.print("Terminated admin\n", .{});
             }
         };
-        temp.startAdminServer(self, io, group, gpa, timeout_s) catch |err| {
+        temp.startAdminServer(self, io, group, gpa) catch |err| {
             std.debug.print("Error starting admin: {any}\n", .{err});
         };
-        // On done, also set topic states
-        for (self.topics.items) |*tp| {
-            tp.is_terminated = true;
-        }
     }
 
     /// Parse a message and call the correct processing function
@@ -299,108 +282,6 @@ pub const KAdmin = struct {
         return 0;
     }
 
-    /// Handle all producer messages in a loop of recv_multishot.
-    /// These messages are supposed to be PCM.
-    pub fn handleProducersLoop(self: *Self, io: Io, gpa: Allocator, timeout_s: i64) void {
-        const temp = struct {
-            pub fn handleProducersLoop(t_self: *Self, t_io: Io, t_gpa: Allocator, t_timeout_s: i64) !void {
-                var cqes: [4]std.os.linux.io_uring_cqe = undefined;
-                if (t_timeout_s != 0) {
-                    _ = try t_self.pring.timeout(0, &.{
-                        .sec = t_timeout_s,
-                        .nsec = 0,
-                    }, 0, 0);
-                    _ = try t_self.pring.submit();
-                }
-                var terminated = false;
-                // Event loop (wait until completion queue has something)
-                while (!t_self.is_terminated) {
-                    // Multi recv, this can comes from multiple stream.
-                    const num_recv = try t_self.pring.copy_cqes(&cqes, 1);
-                    // Recreate the full data buffer
-                    for (cqes[0..num_recv]) |cqe| {
-                        const err = cqe.err();
-                        if (err == .TIME) {
-                            // Timeout here, done...
-                            if (!terminated) {
-                                terminated = true;
-                                _ = try t_self.pring.timeout(0, &.{
-                                    .sec = 10,
-                                    .nsec = 0,
-                                }, 0, 0);
-                                _ = try t_self.pring.submit();
-                                continue;
-                            } else {
-                                std.debug.print("Done producer loop\n", .{});
-                                return;
-                            }
-                        }
-                        if (err != .SUCCESS) {
-                            std.debug.print("Err in producer = {any}\n", .{err});
-                            continue;
-                        }
-                        // User data covert back to a ProducerData pointer, to know which producer it received from.
-                        var pd: *ProducerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                        if (terminated) {
-                            // try pd.stream.shutdown(io, .both);
-                            continue;
-                        }
-                        if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
-                            // On EOF, recv_multishot is automatically cancel, so we just need to free
-                            std.debug.print("EOF from the producer port = {}\n", .{pd.port});
-                            // pd.stream.close(io);
-                            if (pd.data_buf) |sl| {
-                                t_gpa.free(sl);
-                            }
-                            t_gpa.destroy(pd);
-                            continue;
-                        }
-                        const data_full = try t_self.pbg.get(cqe); // Get result for this cqe
-                        // User the port as a way to of storage: each producer port will have a growable buffer that we can just copy data in.
-                        // Copy outside, put it back to kernel after...
-                        if (pd.data_buf) |current_data| {
-                            // Memory is lost here...
-                            const old_buf = current_data;
-                            pd.data_buf = try std.mem.concat(t_gpa, u8, &.{ current_data, data_full });
-                            t_gpa.free(old_buf);
-                        } else {
-                            pd.data_buf = try std.mem.concat(t_gpa, u8, &.{ "", data_full });
-                        }
-                        try t_self.pbg.put(cqe); // Give it back cuz not needed anymore.
-                        if (pd.data_buf) |cur_data| {
-                            // Check if we have recv all message from the socket
-                            if (cqe.flags & std.os.linux.IORING_CQE_F_SOCK_NONEMPTY > 0) {
-                                continue;
-                            }
-                            // Good to be parsed. Ignore the length first byte.
-                            if (message_util.parseMessage(cur_data[1..])) |m| {
-                                switch (m) {
-                                    message_util.MessageType.PCM => |pcm| {
-                                        try pd.topic.addMessage(t_io, t_gpa, &pcm); // Copy and Block until can add.
-                                        try t_self.writeMessageToFD(t_gpa, pd.stream.socket.handle, message_util.Message{
-                                            .R_PCM = 0,
-                                        });
-                                    },
-                                    else => {
-                                        // Not supported
-                                        std.debug.print("Not supported message of other type that PCM\n", .{});
-                                    },
-                                }
-                            }
-                            // Cleanup and make undefined;
-                            t_gpa.free(cur_data);
-                            pd.data_buf = null;
-                        }
-                    }
-                }
-                std.debug.print("Terminated producer\n", .{});
-            }
-        };
-        temp.handleProducersLoop(self, io, gpa, timeout_s) catch |err| {
-            std.debug.print("Error handling producer loop = {any}\n", .{err});
-        };
-    }
-
     // ============================= Consumer ============================
 
     /// Return the position of the consumer in the list
@@ -447,160 +328,6 @@ pub const KAdmin = struct {
         // std.debug.print("Send {} recv_multishot here to {}\n", .{ n, cd.port });
     }
 
-    /// Retry for the consumer write PCM
-    pub fn handleRetryLoop(self: *KAdmin, gpa: Allocator, timeout_s: i64) !void {
-        const temp = struct {
-            pub fn handleRetryLoop(t_self: *KAdmin, t_gpa: Allocator, t_timeout_s: i64) !void {
-                var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
-                if (t_timeout_s != 0) {
-                    _ = try t_self.rring.timeout(0, &.{
-                        .sec = t_timeout_s,
-                        .nsec = 0,
-                    }, 0, 0);
-                    _ = try t_self.rring.submit();
-                }
-                // Event loop
-                while (!t_self.is_terminated) {
-                    const num_recv = try t_self.rring.copy_cqes(&cqes, 1);
-                    for (cqes[0..num_recv]) |cqe| {
-                        const err = cqe.err();
-                        // A timeout will return .TIME
-                        if (err != .TIME) {
-                            std.debug.print("Err in retry = {any}\n", .{err});
-                            continue;
-                        }
-                        if (cqe.user_data == 0) {
-                            std.debug.print("Done in retry\n", .{});
-                            return;
-                        }
-                        var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                        if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
-                            cd.current_timeout.nsec = 10000000;
-                            cd.current_timeout.sec = 0;
-                            cd.topic.mq_lock.lockShared();
-                            // Write message to the stream, no wait and just +1
-                            try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
-                            cd.group.offset += 1;
-                            cd.topic.mq_lock.unlockShared();
-                        } else {
-                            // Double the timeout and send to the retry queue
-                            if (cd.current_timeout.sec != 0) {
-                                cd.current_timeout.sec *= 2;
-                            } else {
-                                cd.current_timeout.nsec *= 2;
-                                if (cd.current_timeout.nsec > 1000000000) {
-                                    cd.current_timeout.sec += @divTrunc(cd.current_timeout.nsec, 1000000000);
-                                    cd.current_timeout.nsec = @rem(cd.current_timeout.nsec, 1000000000);
-                                }
-                            }
-                            _ = try t_self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
-                            _ = try t_self.rring.submit();
-                        }
-                    }
-                }
-                std.debug.print("Terminated retry\n", .{});
-            }
-        };
-        temp.handleRetryLoop(self, gpa, timeout_s) catch |err| {
-            std.debug.print("Error handling retry loop = {any}\n", .{err});
-        };
-    }
-
-    /// Handle all consumer messages in a loop of recv_multishot.
-    /// These are expected to be C_RD and R_C_PCM (1 byte only)
-    pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, timeout_s: i64) void {
-        const temp = struct {
-            pub fn handleConsumersLoop(t_self: *KAdmin, _: Io, t_gpa: Allocator, t_timeout_s: i64) !void {
-                // var write_buf: [1024]u8 = undefined;
-                var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
-                if (t_timeout_s != 0) {
-                    _ = try t_self.cring.timeout(0, &.{
-                        .sec = t_timeout_s,
-                        .nsec = 0,
-                    }, 0, 0);
-                    _ = try t_self.cring.submit();
-                }
-                var terminated = false;
-                // Event loop
-                while (!t_self.is_terminated) {
-                    // Multi recv, this can comes from multiple stream.
-                    const num_recv = try t_self.cring.copy_cqes(&cqes, 1);
-                    // Recreate the full data buffer, these are just 1 bytes so no concat need.
-                    for (cqes[0..num_recv]) |cqe| {
-                        const err = cqe.err();
-                        if (err == .TIME) {
-                            if (!terminated) {
-                                terminated = true;
-                                _ = try t_self.cring.timeout(0, &.{
-                                    .sec = 10,
-                                    .nsec = 0,
-                                }, 0, 0);
-                                _ = try t_self.cring.submit();
-                                continue;
-                            } else {
-                                std.debug.print("Done consumer loop\n", .{});
-                                return;
-                            }
-                        }
-                        if (err != .SUCCESS) {
-                            std.debug.print("Err handling consumer = {any}\n", .{err});
-                            continue;
-                        }
-                        var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                        if (terminated) {
-                            continue;
-                        }
-                        // Upon receive, it's a ready for sure.
-                        // const num_read: usize = @intCast(cqe.res);
-                        if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
-                            std.debug.print("EOF from the consumer port = {}\n", .{cd.port});
-                            // cd.stream.close(io);
-                            t_gpa.destroy(cd.current_timeout);
-                            t_gpa.destroy(cd);
-                            _ = try t_self.rring.cancel(0, cqe.user_data, 0);
-                            _ = try t_self.rring.submit();
-                            continue;
-                        }
-                        // Get and put back seems unneeded, but this is for clearing the buffer.
-                        const data = try t_self.cbg.get(cqe); // Get result for this cqe
-                        // Good to be parsed. Ignore the length first byte.
-                        if (message_util.parseMessage(data[0..])) |m| {
-                            switch (m) {
-                                message_util.MessageType.R_C_PCM => |_| {
-                                    // Write the PCM to the consumer
-                                    // std.debug.print("Got the lock for {}\n", .{cd.port});
-                                    if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
-                                        cd.current_timeout.nsec = 10000000;
-                                        cd.current_timeout.sec = 0;
-                                        cd.topic.mq_lock.lockShared();
-                                        // Write message to the stream, no wait and just +1
-                                        try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
-                                        cd.group.offset += 1;
-                                        cd.topic.mq_lock.unlockShared();
-                                    } else {
-                                        // Send to the retry queue
-                                        _ = try t_self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
-                                        _ = try t_self.rring.submit();
-                                    }
-                                },
-                                else => {
-                                    // Not supported
-                                    std.debug.print("Not supported message of other type that PCM\n", .{});
-                                },
-                            }
-                        }
-
-                        try t_self.cbg.put(cqe); // Give it back cuz not needed anymore.
-                    }
-                }
-                std.debug.print("Terminated consumer\n", .{});
-            }
-        };
-        temp.handleConsumersLoop(self, io, gpa, timeout_s) catch |err| {
-            std.debug.print("Error handling consumer loop = {any}\n", .{err});
-        };
-    }
-
     // ============================ Write / Send ============================
 
     /// Write a message using `send` to a socket.
@@ -608,7 +335,7 @@ pub const KAdmin = struct {
     fn writeMessageToFD(self: *KAdmin, gpa: Allocator, fd: net.Socket.Handle, message: message_util.Message) !void {
         const buf = try gpa.alloc(u8, 1024);
         const wd = try gpa.create(WriteData);
-        wd.full_slice = buf;
+        wd.full_slice = buf; // dealloc on write done
         switch (message) {
             message_util.MessageType.PCM => |pcm| {
                 const data = try pcm.convertToBytesWithLengthAndType(buf);
@@ -634,51 +361,296 @@ pub const KAdmin = struct {
         }
     }
 
-    /// Event loop to handle all write. These just return a buffer to us for now.
-    /// If you need to handle different type of write, you can create a struct for it.
-    pub fn handleWriteLoop(self: *KAdmin, gpa: Allocator, timeout_s: i64) void {
-        const temp = struct {
-            pub fn handleWriteLoop(t_self: *KAdmin, t_gpa: Allocator, t_timeout_s: i64) !void {
-                var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
-                if (t_timeout_s != 0) {
-                    _ = try t_self.wring.timeout(0, &.{
-                        .sec = t_timeout_s,
-                        .nsec = 0,
-                    }, 0, 0);
-                    _ = try t_self.wring.submit();
+    /// Cancel by sending nop, upon which we will cancel the loop
+    pub fn sendCancelSignal(self: *Self) !void {
+        _ = try self.aring.nop(0);
+        _ = try self.aring.submit();
+        _ = try self.pring.nop(0);
+        _ = try self.pring.submit();
+        _ = try self.cring.nop(0);
+        _ = try self.cring.submit();
+        _ = try self.rring.nop(0);
+        _ = try self.rring.submit();
+        _ = try self.wring.nop(0);
+        _ = try self.wring.submit();
+    }
+
+    pub fn deinit(self: *Self, gpa: Allocator) void {
+        self.aring.deinit();
+        self.pring.deinit();
+        self.cring.deinit();
+        self.wring.deinit();
+        self.rring.deinit();
+        self.pbg.deinit(gpa);
+        self.cbg.deinit(gpa);
+        self.stream_list.deinit(gpa);
+        self.topics.deinit(gpa);
+    }
+};
+
+// =================================== Event loops ========================================
+
+/// Handle all producer messages in a loop of recv_multishot.
+/// These messages are supposed to be PCM.
+pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
+    const temp = struct {
+        /// Handle full message in the ProducerData
+        fn handleFullPCMMessage(t_self: *KAdmin, t_io: Io, t_gpa: Allocator, pd: *ProducerData) !void {
+            if (message_util.parseMessage(pd.data_buf.?[1..])) |m| {
+                switch (m) {
+                    message_util.MessageType.PCM => |pcm| {
+                        try pd.topic.addMessage(t_io, t_gpa, &pcm); // Copy and Block until can add.
+                        try t_self.writeMessageToFD(t_gpa, pd.stream.socket.handle, message_util.Message{
+                            .R_PCM = 0,
+                        });
+                    },
+                    else => {
+                        // Not supported
+                        std.debug.print("Not supported message of other type that PCM\n", .{});
+                    },
                 }
-                // Event loop
-                while (!t_self.is_terminated) {
-                    const num_write = try t_self.wring.copy_cqes(&cqes, 1);
-                    // Recreate the full data buffer, these are just 1 bytes so no concat need.
-                    for (cqes[0..num_write]) |cqe| {
-                        const err = cqe.err();
-                        if (err == .TIME) {
-                            std.debug.print("Done write loop\n", .{});
-                            return;
+            }
+            // Clean up;
+            t_gpa.free(pd.data_buf.?);
+            pd.data_buf = null;
+        }
+
+        /// Handle EOF signal from recv, meaning the producer has already left.
+        fn isHandledEOF(t_gpa: Allocator, cqe: linux.io_uring_cqe, pd: *ProducerData) bool {
+            if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
+                // On EOF, recv_multishot is automatically cancel, so we just need to free
+                std.debug.print("EOF from the producer port = {}\n", .{pd.port});
+                if (pd.data_buf) |sl| {
+                    t_gpa.free(sl);
+                }
+                t_gpa.destroy(pd);
+                return true;
+            }
+            return false;
+        }
+
+        pub fn handleProducersLoop(t_self: *KAdmin, t_io: Io, t_gpa: Allocator) !void {
+            var cqes: [1 << 3]linux.io_uring_cqe = undefined;
+            // Event loop (wait until completion queue has something)
+            while (true) {
+                // Multi recv, this can comes from multiple stream.
+                const num_recv = try t_self.pring.copy_cqes(&cqes, 1);
+                // Recreate the full data buffer
+                for (cqes[0..num_recv]) |cqe| {
+                    if (cqe.user_data == 0) {
+                        // End
+                        std.debug.print("Terminated producers\n", .{});
+                        return;
+                    }
+                    const err = cqe.err();
+                    if (err != .SUCCESS) {
+                        std.debug.print("Err in producer = {any}\n", .{err});
+                        continue;
+                    }
+                    // User data covert back to a ProducerData pointer, to know which producer it received from.
+                    var pd: *ProducerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                    // Handle recv EOF
+                    if (isHandledEOF(t_gpa, cqe, pd)) {
+                        continue;
+                    }
+                    const data_full = try t_self.pbg.get(cqe); // Get result for this cqe
+                    // User the port as a way to of storage: each producer port will have a growable buffer that we can just copy data in.
+                    // Copy outside, put it back to kernel after...
+                    if (pd.data_buf) |current_data| {
+                        // Memory is lost here...
+                        const old_buf = current_data;
+                        pd.data_buf = try std.mem.concat(t_gpa, u8, &.{ current_data, data_full });
+                        t_gpa.free(old_buf);
+                    } else {
+                        pd.data_buf = try std.mem.concat(t_gpa, u8, &.{ "", data_full });
+                    }
+                    try t_self.pbg.put(cqe); // Give it back cuz not needed anymore.
+                    // Check if we have recv all message from the socket
+                    if (cqe.flags & std.os.linux.IORING_CQE_F_SOCK_NONEMPTY > 0) {
+                        continue;
+                    }
+                    // Good to be parsed. Ignore the length first byte.
+                    try handleFullPCMMessage(t_self, t_io, t_gpa, pd);
+                }
+            }
+        }
+    };
+    temp.handleProducersLoop(self, io, gpa) catch |err| {
+        std.debug.print("Error handling producer loop = {any}\n", .{err});
+    };
+}
+
+/// Handle all consumer messages in a loop of recv_multishot.
+/// These are expected to be C_RD and R_C_PCM (1 byte only)
+pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
+    const temp = struct {
+        fn isHandledEOF(t_self: *KAdmin, t_gpa: Allocator, cqe: linux.io_uring_cqe, cd: *ConsumerData) !bool {
+            if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
+                std.debug.print("EOF from the consumer port = {}\n", .{cd.port});
+                // cd.stream.close(io);
+                t_gpa.destroy(cd.current_timeout);
+                t_gpa.destroy(cd);
+                _ = try t_self.rring.cancel(0, cqe.user_data, 0);
+                _ = try t_self.rring.submit();
+                return true;
+            }
+            return false;
+        }
+
+        pub fn handleConsumersLoop(t_self: *KAdmin, _: Io, t_gpa: Allocator) !void {
+            var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+            while (true) {
+                // Multi recv, this can comes from multiple stream.
+                // recv is an ack from the consumer which contains only 1 byte.
+                const num_recv = try t_self.cring.copy_cqes(&cqes, 1);
+                for (cqes[0..num_recv]) |cqe| {
+                    if (cqe.user_data == 0) {
+                        std.debug.print("Terminated consumers\n", .{});
+                        return;
+                    }
+                    const err = cqe.err();
+                    if (err != .SUCCESS) {
+                        std.debug.print("Err handling consumer = {any}\n", .{err});
+                        continue;
+                    }
+                    var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                    // Upon receive, it's a ready for sure.
+                    if (try isHandledEOF(t_self, t_gpa, cqe, cd)) {
+                        continue;
+                    }
+                    // Get and put back seems unneeded, but this is for clearing the buffer.
+                    const data = try t_self.cbg.get(cqe); // Get result for this cqe
+                    // Good to be parsed. Ignore the length first byte.
+                    if (message_util.parseMessage(data[0..])) |m| {
+                        switch (m) {
+                            message_util.MessageType.R_C_PCM => |_| {
+                                // Write the PCM to the consumer
+                                // TODO: Is it safe to peek without lock?
+                                if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
+                                    cd.current_timeout.nsec = 10000000;
+                                    cd.current_timeout.sec = 0;
+                                    cd.topic.mq_lock.lock();
+                                    // Write message to the stream, no wait and just +1
+                                    try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
+                                    cd.group.offset += 1;
+                                    cd.topic.mq_lock.unlock();
+                                } else {
+                                    // Send to the retry queue
+                                    // TODO: To eliminate retry, we can try to wait and wake
+                                    _ = try t_self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
+                                    _ = try t_self.rring.submit();
+                                }
+                            },
+                            else => {
+                                // Not supported
+                                std.debug.print("Not supported message of other type that PCM\n", .{});
+                            },
                         }
-                        if (err != .SUCCESS) {
-                            std.debug.print("Err sending data = {any}\n", .{err});
-                            continue;
-                        }
-                        // Free data
-                        const wd: *WriteData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                        wd.cur_written += @as(usize, @intCast(cqe.res));
-                        if (wd.cur_written < wd.need_written) {
-                            std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
-                            // Need to keep writing.
-                            _ = try t_self.wring.send(cqe.user_data, wd.fd, wd.full_slice[wd.cur_written..], 0);
-                            _ = try t_self.wring.submit();
+                    }
+
+                    try t_self.cbg.put(cqe); // Give it back cuz not needed anymore.
+                }
+            }
+            std.debug.print("Terminated consumer\n", .{});
+        }
+    };
+    temp.handleConsumersLoop(self, io, gpa) catch |err| {
+        std.debug.print("Error handling consumer loop = {any}\n", .{err});
+    };
+}
+
+/// Retry for the consumer write PCM in case there's no message yet to send.
+pub fn handleRetryLoop(self: *KAdmin, gpa: Allocator) !void {
+    const temp = struct {
+        pub fn handleRetryLoop(t_self: *KAdmin, t_gpa: Allocator) !void {
+            var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+            // Event loop
+            while (!t_self.is_terminated) {
+                const num_recv = try t_self.rring.copy_cqes(&cqes, 1);
+                for (cqes[0..num_recv]) |cqe| {
+                    if (cqe.user_data == 0) {
+                        std.debug.print("Terminated retry\n", .{});
+                        return;
+                    }
+                    const err = cqe.err();
+                    // A timeout will return .TIME
+                    if (err != .TIME) {
+                        std.debug.print("Err in retry = {any}\n", .{err});
+                        continue;
+                    }
+                    if (cqe.user_data == 0) {
+                        std.debug.print("Done in retry\n", .{});
+                        return;
+                    }
+                    var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                    if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
+                        cd.current_timeout.nsec = 10000000;
+                        cd.current_timeout.sec = 0;
+                        cd.topic.mq_lock.lock();
+                        // Write message to the stream, no wait and just +1
+                        try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
+                        cd.group.offset += 1;
+                        cd.topic.mq_lock.unlock();
+                    } else {
+                        // Double the timeout and send to the retry queue
+                        if (cd.current_timeout.sec != 0) {
+                            cd.current_timeout.sec *= 2;
                         } else {
-                            t_gpa.free(wd.full_slice);
-                            t_gpa.destroy(wd);
+                            cd.current_timeout.nsec *= 2;
+                            if (cd.current_timeout.nsec > 1000000000) {
+                                cd.current_timeout.sec += @divTrunc(cd.current_timeout.nsec, 1000000000);
+                                cd.current_timeout.nsec = @rem(cd.current_timeout.nsec, 1000000000);
+                            }
                         }
+                        _ = try t_self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
+                        _ = try t_self.rring.submit();
                     }
                 }
             }
-        };
-        temp.handleWriteLoop(self, gpa, timeout_s) catch |err| {
-            std.debug.print("Error handling loop = {any}\n", .{err});
-        };
-    }
-};
+            std.debug.print("Terminated retry\n", .{});
+        }
+    };
+    temp.handleRetryLoop(self, gpa) catch |err| {
+        std.debug.print("Error handling retry loop = {any}\n", .{err});
+    };
+}
+
+/// Event loop to handle all write. These just return a buffer to us for now.
+/// If you need to handle different type of write, you can create a struct for it.
+pub fn handleWriteLoop(self: *KAdmin, gpa: Allocator) void {
+    const temp = struct {
+        pub fn handleWriteLoop(t_self: *KAdmin, t_gpa: Allocator) !void {
+            var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+            // Event loop
+            while (true) {
+                const num_write = try t_self.wring.copy_cqes(&cqes, 1);
+                for (cqes[0..num_write]) |cqe| {
+                    if (cqe.user_data == 0) {
+                        std.debug.print("Terminated write\n", .{});
+                        return;
+                    }
+                    const err = cqe.err();
+                    if (err != .SUCCESS) {
+                        std.debug.print("Err sending data = {any}\n", .{err});
+                        continue;
+                    }
+                    const wd: *WriteData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                    wd.cur_written += @as(usize, @intCast(cqe.res));
+                    if (wd.cur_written < wd.need_written) {
+                        std.debug.print("Written data to fd = {any}, total = {}, need = {}\n", .{ wd.fd, wd.cur_written, wd.need_written });
+                        // Need to keep writing.
+                        _ = try t_self.wring.send(cqe.user_data, wd.fd, wd.full_slice[wd.cur_written..], 0);
+                        _ = try t_self.wring.submit();
+                    } else {
+                        // Free data on done
+                        t_gpa.free(wd.full_slice);
+                        t_gpa.destroy(wd);
+                    }
+                }
+            }
+        }
+    };
+    temp.handleWriteLoop(self, gpa) catch |err| {
+        std.debug.print("Error handling loop = {any}\n", .{err});
+    };
+}

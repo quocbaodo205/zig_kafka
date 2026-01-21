@@ -74,7 +74,7 @@ pub const Topic = struct {
             for (self.cgroups.items) |*cg| {
                 min_offset = @min(min_offset, cg.offset);
             }
-            // std.debug.print("Get to popping in topic {}, min_offset = {}, pop_num = {}\n", .{ self.topic_id, min_offset, self.mq.pop_num });
+            std.debug.print("Get to popping in topic {}, min_offset = {}, pop_num = {}\n", .{ self.topic_id, min_offset, self.mq.pop_num });
             self.mq_lock.lock(); // Lock to pop
             if (min_offset == 1000000000) {
                 self.mq_lock.unlock();
