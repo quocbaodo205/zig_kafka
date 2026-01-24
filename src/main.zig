@@ -43,17 +43,14 @@ pub fn initKAdmin() !void {
     var pring = try iou.init(8, 0);
     var cring = try iou.init(8, 0);
     var wring = try iou.init(8, 0);
-    var rring = try iou.init(64, 0); // Allow many retry.
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
     // Start needed threads for event loops
-    admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &rring, &pbg, &cbg);
+    admin = try kadmin.KAdmin.init(gpa, &aring, &pring, &cring, &wring, &pbg, &cbg);
     defer admin.deinit(gpa);
     try group.concurrent(io, kadmin.KAdmin.startAdminServer, .{ &admin, io, &group, gpa });
     try group.concurrent(io, kadmin.handleProducersLoop, .{ &admin, io, gpa });
-    try group.concurrent(io, kadmin.handleConsumersLoop, .{ &admin, io, gpa });
     try group.concurrent(io, kadmin.handleWriteLoop, .{ &admin, gpa });
-    try group.concurrent(io, kadmin.handleRetryLoop, .{ &admin, gpa });
     try group.await(io);
     std.debug.print("Everything stop in admin\n", .{});
     std.process.exit(0); // Terminate everything else
@@ -79,7 +76,7 @@ pub fn initProducerWithParams(port: u16, topic: u32, delay_ms: i64) !void {
         try p.writeMessage(io, try std.fmt.allocPrint(gpa, "Ping from {}", .{port}));
         try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
     }
-    std.debug.print("Producer is done\n", .{});
+    std.debug.print("Producer port {} is done\n", .{port});
 }
 
 pub fn initConsumer(args: []const [:0]const u8) !void {
@@ -99,19 +96,19 @@ pub fn initConsumerWithParams(port: u16, topic: u32, group: u32, delay_ms: i64) 
     var c = try consumer.ConsumerProcess.init(port, topic, group);
     try c.startConsumerServer(io);
     // Always try to receive message
+    c.sendReadyMessage(io) catch |err| {
+        std.debug.print("Error sending ready message: {any}\n", .{err});
+        return;
+    };
     while (true) {
         // for (0..100) |_| {
         try std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake);
-        c.sendReadyMessage(io) catch |err| {
-            std.debug.print("Error sending ready message: {any}\n", .{err});
-            break;
-        };
-        c.receiveMessage(io) catch |err| {
+        c.receiveMessageAndReadyBack(io) catch |err| {
             std.debug.print("Error receive message: {any}\n", .{err});
             break;
         };
     }
-    std.debug.print("Consumer is done\n", .{});
+    std.debug.print("Consumer port {} is done\n", .{port});
 }
 
 pub fn initMemory() !void {

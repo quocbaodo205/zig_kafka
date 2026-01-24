@@ -64,7 +64,6 @@ pub const KAdmin = struct {
     const Self = @This();
 
     admin_address: net.IpAddress,
-    is_terminated: bool,
 
     // A list of topic that the admin keeps track
     topics: std.ArrayList(topic.Topic),
@@ -73,7 +72,6 @@ pub const KAdmin = struct {
     pring: *iou,
     cring: *iou,
     wring: *iou,
-    rring: *iou,
     pbg: *iou.BufferGroup,
     cbg: *iou.BufferGroup,
 
@@ -81,10 +79,9 @@ pub const KAdmin = struct {
     stream_list: std.ArrayList(net.Stream),
 
     /// Init accept a buffer that will be used for all allocation and processing.
-    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, rring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
+    pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
         return Self{
-            .is_terminated = false,
             .admin_address = address,
             // Topics
             .topics = try std.ArrayList(topic.Topic).initCapacity(gpa, 10),
@@ -93,7 +90,6 @@ pub const KAdmin = struct {
             .pring = pring,
             .cring = cring,
             .wring = wring,
-            .rring = rring,
             .pbg = pbg,
             .cbg = cbg,
             .stream_list = try std.ArrayList(net.Stream).initCapacity(gpa, 10),
@@ -103,7 +99,7 @@ pub const KAdmin = struct {
     /// Write the current state to file as a way of persistent.
     /// Call when the state changed, like adding a new topic or adding a consumer group.
     pub fn writeOverallStateToFile(self: *Self, io: Io) !void {
-        const f = try Io.Dir.openFile(Io.Dir.cwd(), io, "overall_state", .{ .mode = .write_only });
+        const f = try Io.Dir.createFile(Io.Dir.cwd(), io, "overall_state", .{ .read = false, .truncate = true });
         defer f.close(io); // Persist by close
         var buf: [10240]u8 = undefined; // Big buffer
         var wr = f.writer(io, &buf);
@@ -146,10 +142,57 @@ pub const KAdmin = struct {
         }
     }
 
+    /// Cancel by sending nop, upon which we will cancel the loop
+    pub fn sendCancelSignal(self: *Self) !void {
+        _ = try self.aring.nop(0);
+        _ = try self.aring.submit();
+        _ = try self.pring.nop(0);
+        _ = try self.pring.submit();
+        _ = try self.cring.nop(0);
+        _ = try self.cring.submit();
+        _ = try self.wring.nop(0);
+        _ = try self.wring.submit();
+        // TODO: Send cancel to each consumer groups ring
+    }
+
+    pub fn deinit(self: *Self, gpa: Allocator) void {
+        self.aring.deinit();
+        self.pring.deinit();
+        self.cring.deinit();
+        self.wring.deinit();
+        self.pbg.deinit(gpa);
+        self.cbg.deinit(gpa);
+        self.stream_list.deinit(gpa);
+        self.topics.deinit(gpa);
+    }
+
+    // ==================================== Admin handling ==============================
+
     /// Main function to start an admin server and wait for a message
     pub fn startAdminServer(self: *Self, io: Io, group: *Io.Group, gpa: Allocator) void {
         // Anon function
         const temp = struct {
+            fn isHandledTerminate(t_self: *Self, t_io: Io, cqe: linux.io_uring_cqe) !bool {
+                if (cqe.user_data == 0) {
+                    std.debug.print("Shutdown all stream: {} streams\n", .{t_self.stream_list.items.len});
+                    for (t_self.stream_list.items) |stream| {
+                        try stream.shutdown(t_io, .both);
+                    }
+                    // On done, also set topic states
+                    for (t_self.topics.items) |*tp| {
+                        tp.is_terminated = true;
+                        for (tp.cgroups.items) |*cg| {
+                            // Send a nop
+                            _ = try cg.ring.nop(0);
+                            _ = try cg.ring.submit();
+                        }
+                    }
+                    std.debug.print("Terminated admin\n", .{});
+                    return true;
+                }
+                return false;
+            }
+
             pub fn startAdminServer(t_self: *Self, t_io: Io, t_group: *Io.Group, t_gpa: Allocator) !void {
                 var cqes: [2]std.os.linux.io_uring_cqe = undefined;
                 // Create a server on the address and wait for a connection
@@ -160,32 +203,21 @@ pub const KAdmin = struct {
 
                 // io_uring accept
                 _ = try t_self.aring.accept_multishot(1, server.socket.handle, null, null, 0);
+                _ = try t_self.aring.submit();
 
                 // Read / write buffer for admin only.
                 var read_buf: [1024]u8 = undefined;
                 var write_buf: [1024]u8 = undefined;
 
                 // Event loop to process admin accept
-                // Use inline completion since these messages are supposed to be quick.
-                // Also don't have to batch, these are very short and fast.
                 std.debug.print("Starting admin server...\n", .{});
-                while (!t_self.is_terminated) {
+                while (true) {
                     const num_ready = try t_self.aring.copy_cqes(&cqes, 1);
                     for (cqes[0..num_ready]) |cqe| {
-                        const err = cqe.err();
-                        if (cqe.user_data == 0) {
-                            // End it.
-                            std.debug.print("Shutdown all stream: {} streams\n", .{t_self.stream_list.items.len});
-                            for (t_self.stream_list.items) |stream| {
-                                try stream.shutdown(t_io, .both);
-                            }
-                            // On done, also set topic states
-                            for (t_self.topics.items) |*tp| {
-                                tp.is_terminated = true;
-                            }
-                            std.debug.print("Terminated admin\n", .{});
+                        if (try isHandledTerminate(t_self, t_io, cqe)) {
                             return;
                         }
+                        const err = cqe.err();
                         if (err == .SUCCESS) {
                             const fd = cqe.res; // The fd for the accepted socket (read / write using it)
                             // New stream, with the accepted socket.
@@ -228,7 +260,7 @@ pub const KAdmin = struct {
                 };
             },
             message_util.MessageType.C_REG => |consumer_register_message| {
-                try self.processConsumerRegisterMessage(io, gpa, &consumer_register_message);
+                try self.processConsumerRegisterMessage(io, group, gpa, &consumer_register_message);
                 return message_util.Message{
                     .R_C_REG = 0,
                 };
@@ -285,7 +317,7 @@ pub const KAdmin = struct {
     // ============================= Consumer ============================
 
     /// Return the position of the consumer in the list
-    fn processConsumerRegisterMessage(self: *Self, io: Io, gpa: Allocator, rm: *const message_util.ConsumerRegisterMessage) !void {
+    fn processConsumerRegisterMessage(self: *Self, io: Io, group: *Io.Group, gpa: Allocator, rm: *const message_util.ConsumerRegisterMessage) !void {
         // Check if topic exist
         var exist = false;
         var tp: *topic.Topic = undefined;
@@ -313,9 +345,11 @@ pub const KAdmin = struct {
             }
         }
         if (!exist) {
-            try tp.addNewCGroup(gpa, rm.group_id);
+            try tp.addNewCGroup(io, gpa, rm.group_id);
             try self.writeOverallStateToFile(io); //Persist to disk
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
+            // Thread for handling consumer loop for this CGroup.
+            try group.concurrent(io, handleConsumersLoop, .{ self, io, gpa, cg });
         }
         // Add the port, stream and stream_state
         const cd = try gpa.create(ConsumerData);
@@ -323,9 +357,8 @@ pub const KAdmin = struct {
         try self.stream_list.append(gpa, stream);
         // Each consumer will send a ready to start receiving messages. This is just 1 byte.
         const cd_data = @intFromPtr(cd);
-        _ = try self.cbg.recv_multishot(cd_data, cd.stream.socket.handle, 0);
-        _ = try self.cring.submit();
-        // std.debug.print("Send {} recv_multishot here to {}\n", .{ n, cd.port });
+        _ = try cg.bg.recv_multishot(cd_data, cd.stream.socket.handle, 0);
+        _ = try cg.ring.submit();
     }
 
     // ============================ Write / Send ============================
@@ -359,32 +392,6 @@ pub const KAdmin = struct {
                 // Not supported.
             },
         }
-    }
-
-    /// Cancel by sending nop, upon which we will cancel the loop
-    pub fn sendCancelSignal(self: *Self) !void {
-        _ = try self.aring.nop(0);
-        _ = try self.aring.submit();
-        _ = try self.pring.nop(0);
-        _ = try self.pring.submit();
-        _ = try self.cring.nop(0);
-        _ = try self.cring.submit();
-        _ = try self.rring.nop(0);
-        _ = try self.rring.submit();
-        _ = try self.wring.nop(0);
-        _ = try self.wring.submit();
-    }
-
-    pub fn deinit(self: *Self, gpa: Allocator) void {
-        self.aring.deinit();
-        self.pring.deinit();
-        self.cring.deinit();
-        self.wring.deinit();
-        self.rring.deinit();
-        self.pbg.deinit(gpa);
-        self.cbg.deinit(gpa);
-        self.stream_list.deinit(gpa);
-        self.topics.deinit(gpa);
     }
 };
 
@@ -482,29 +489,28 @@ pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
 
 /// Handle all consumer messages in a loop of recv_multishot.
 /// These are expected to be C_RD and R_C_PCM (1 byte only)
-pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
+pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CGroup) void {
     const temp = struct {
-        fn isHandledEOF(t_self: *KAdmin, t_gpa: Allocator, cqe: linux.io_uring_cqe, cd: *ConsumerData) !bool {
+        fn isHandledEOF(t_gpa: Allocator, cqe: linux.io_uring_cqe, cd: *ConsumerData) !bool {
             if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
                 std.debug.print("EOF from the consumer port = {}\n", .{cd.port});
-                // cd.stream.close(io);
+                // std.process.exit(1); // DEBUG
                 t_gpa.destroy(cd.current_timeout);
                 t_gpa.destroy(cd);
-                _ = try t_self.rring.cancel(0, cqe.user_data, 0);
-                _ = try t_self.rring.submit();
                 return true;
             }
             return false;
         }
 
-        pub fn handleConsumersLoop(t_self: *KAdmin, _: Io, t_gpa: Allocator) !void {
+        pub fn handleConsumersLoop(t_self: *KAdmin, t_io: Io, t_gpa: Allocator, t_cg: *cgroup.CGroup) !void {
             var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
             while (true) {
                 // Multi recv, this can comes from multiple stream.
                 // recv is an ack from the consumer which contains only 1 byte.
-                const num_recv = try t_self.cring.copy_cqes(&cqes, 1);
+                const num_recv = try t_cg.ring.copy_cqes(&cqes, 1);
                 for (cqes[0..num_recv]) |cqe| {
                     if (cqe.user_data == 0) {
+                        t_cg.deinit(t_gpa);
                         std.debug.print("Terminated consumers\n", .{});
                         return;
                     }
@@ -515,31 +521,32 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
                     }
                     var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
                     // Upon receive, it's a ready for sure.
-                    if (try isHandledEOF(t_self, t_gpa, cqe, cd)) {
+                    if (try isHandledEOF(t_gpa, cqe, cd)) {
                         continue;
                     }
                     // Get and put back seems unneeded, but this is for clearing the buffer.
-                    const data = try t_self.cbg.get(cqe); // Get result for this cqe
+                    const data = try t_cg.bg.get(cqe); // Get result for this cqe
                     // Good to be parsed. Ignore the length first byte.
                     if (message_util.parseMessage(data[0..])) |m| {
                         switch (m) {
                             message_util.MessageType.R_C_PCM => |_| {
+                                // std.debug.print("Ready from consumer {}, fd = {}\n", .{ cd.port, cd.stream.socket.handle }); // DEBUG
                                 // Write the PCM to the consumer
-                                // TODO: Is it safe to peek without lock?
-                                if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
-                                    cd.current_timeout.nsec = 10000000;
-                                    cd.current_timeout.sec = 0;
-                                    cd.topic.mq_lock.lock();
-                                    // Write message to the stream, no wait and just +1
-                                    try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
-                                    cd.group.offset += 1;
-                                    cd.topic.mq_lock.unlock();
-                                } else {
-                                    // Send to the retry queue
-                                    // TODO: To eliminate retry, we can try to wait and wake
-                                    _ = try t_self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
-                                    _ = try t_self.rring.submit();
+                                try cd.topic.mq_lock.lock(t_io);
+                                if (!cd.topic.mq.can_peek(cd.group.offset)) {
+                                    // std.debug.print("Consumer group {any} is too fast, wait now...\n", .{cd.group.group_id});
+                                    cd.topic.cond.waitUncancelable(t_io, &cd.topic.mq_lock);
+                                    // After wake up, mq_lock is locked, and there's data so we can peek now.
+                                    // std.debug.print("Consumer group {any} is woken up!\n", .{cd.group.group_id});
                                 }
+                                if (!cd.topic.mq.can_peek(cd.group.offset)) {
+                                    @panic("Still cannot peek!\n");
+                                }
+                                const pcm = cd.topic.mq.peek(cd.group.offset).?;
+                                // Write message to the stream, no wait and just +1
+                                try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
+                                cd.group.offset += 1;
+                                cd.topic.mq_lock.unlock(t_io);
                             },
                             else => {
                                 // Not supported
@@ -548,70 +555,13 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
                         }
                     }
 
-                    try t_self.cbg.put(cqe); // Give it back cuz not needed anymore.
+                    try t_cg.bg.put(cqe); // Give it back cuz not needed anymore.
                 }
             }
-            std.debug.print("Terminated consumer\n", .{});
         }
     };
-    temp.handleConsumersLoop(self, io, gpa) catch |err| {
+    temp.handleConsumersLoop(self, io, gpa, cg) catch |err| {
         std.debug.print("Error handling consumer loop = {any}\n", .{err});
-    };
-}
-
-/// Retry for the consumer write PCM in case there's no message yet to send.
-pub fn handleRetryLoop(self: *KAdmin, gpa: Allocator) !void {
-    const temp = struct {
-        pub fn handleRetryLoop(t_self: *KAdmin, t_gpa: Allocator) !void {
-            var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
-            // Event loop
-            while (!t_self.is_terminated) {
-                const num_recv = try t_self.rring.copy_cqes(&cqes, 1);
-                for (cqes[0..num_recv]) |cqe| {
-                    if (cqe.user_data == 0) {
-                        std.debug.print("Terminated retry\n", .{});
-                        return;
-                    }
-                    const err = cqe.err();
-                    // A timeout will return .TIME
-                    if (err != .TIME) {
-                        std.debug.print("Err in retry = {any}\n", .{err});
-                        continue;
-                    }
-                    if (cqe.user_data == 0) {
-                        std.debug.print("Done in retry\n", .{});
-                        return;
-                    }
-                    var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-                    if (cd.topic.mq.peek(cd.group.offset)) |pcm| {
-                        cd.current_timeout.nsec = 10000000;
-                        cd.current_timeout.sec = 0;
-                        cd.topic.mq_lock.lock();
-                        // Write message to the stream, no wait and just +1
-                        try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
-                        cd.group.offset += 1;
-                        cd.topic.mq_lock.unlock();
-                    } else {
-                        // Double the timeout and send to the retry queue
-                        if (cd.current_timeout.sec != 0) {
-                            cd.current_timeout.sec *= 2;
-                        } else {
-                            cd.current_timeout.nsec *= 2;
-                            if (cd.current_timeout.nsec > 1000000000) {
-                                cd.current_timeout.sec += @divTrunc(cd.current_timeout.nsec, 1000000000);
-                                cd.current_timeout.nsec = @rem(cd.current_timeout.nsec, 1000000000);
-                            }
-                        }
-                        _ = try t_self.rring.timeout(cqe.user_data, cd.current_timeout, 0, 0);
-                        _ = try t_self.rring.submit();
-                    }
-                }
-            }
-            std.debug.print("Terminated retry\n", .{});
-        }
-    };
-    temp.handleRetryLoop(self, gpa) catch |err| {
-        std.debug.print("Error handling retry loop = {any}\n", .{err});
     };
 }
 
@@ -642,6 +592,7 @@ pub fn handleWriteLoop(self: *KAdmin, gpa: Allocator) void {
                         _ = try t_self.wring.send(cqe.user_data, wd.fd, wd.full_slice[wd.cur_written..], 0);
                         _ = try t_self.wring.submit();
                     } else {
+                        // std.debug.print("Written full data to fd = {any}\n", .{wd.fd}); // DEBUG
                         // Free data on done
                         t_gpa.free(wd.full_slice);
                         t_gpa.destroy(wd);

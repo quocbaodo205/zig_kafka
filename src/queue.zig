@@ -68,6 +68,15 @@ pub fn Queue(comptime T: type, max_n: comptime_int) type {
             return pop_data;
         }
 
+        /// Check if we can peek a position from the start
+        pub fn can_peek(self: *const Self, pos: usize) bool {
+            const true_pos = pos - self.pop_num;
+            if (true_pos >= self.len) {
+                return false;
+            }
+            return true;
+        }
+
         /// Peek a position from the start
         pub fn peek(self: *const Self, pos: usize) ?T {
             const true_pos = pos - self.pop_num;
