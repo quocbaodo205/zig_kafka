@@ -152,7 +152,6 @@ pub const KAdmin = struct {
         _ = try self.cring.submit();
         _ = try self.wring.nop(0);
         _ = try self.wring.submit();
-        // TODO: Send cancel to each consumer groups ring
     }
 
     pub fn deinit(self: *Self, gpa: Allocator) void {
@@ -180,11 +179,14 @@ pub const KAdmin = struct {
                     }
                     // On done, also set topic states
                     for (t_self.topics.items) |*tp| {
+                        std.debug.print("Terminating topic {}\n", .{tp.topic_id});
+                        tp.cond.broadcast(t_io);
                         tp.is_terminated = true;
                         for (tp.cgroups.items) |*cg| {
                             // Send a nop
                             _ = try cg.ring.nop(0);
                             _ = try cg.ring.submit();
+                            std.debug.print("Sent a nop to cgroup {}\n", .{cg.group_id});
                         }
                     }
                     std.debug.print("Terminated admin\n", .{});
@@ -511,7 +513,7 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
                 for (cqes[0..num_recv]) |cqe| {
                     if (cqe.user_data == 0) {
                         t_cg.deinit(t_gpa);
-                        std.debug.print("Terminated consumers\n", .{});
+                        std.debug.print("Terminated consumer loop for cg = {}\n", .{t_cg.group_id});
                         return;
                     }
                     const err = cqe.err();
@@ -534,13 +536,14 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
                                 // Write the PCM to the consumer
                                 try cd.topic.mq_lock.lock(t_io);
                                 if (!cd.topic.mq.can_peek(cd.group.offset)) {
-                                    // std.debug.print("Consumer group {any} is too fast, wait now...\n", .{cd.group.group_id});
                                     cd.topic.cond.waitUncancelable(t_io, &cd.topic.mq_lock);
-                                    // After wake up, mq_lock is locked, and there's data so we can peek now.
-                                    // std.debug.print("Consumer group {any} is woken up!\n", .{cd.group.group_id});
                                 }
+                                // After wake up, mq_lock is locked, and there's data so we can peek now.
+                                // If we cannot peek, it means that the wake up is for termination.
                                 if (!cd.topic.mq.can_peek(cd.group.offset)) {
-                                    @panic("Still cannot peek!\n");
+                                    std.debug.print("Wake up for termination in cg = {}\n", .{t_cg.group_id});
+                                    cd.topic.mq_lock.unlock(t_io);
+                                    continue;
                                 }
                                 const pcm = cd.topic.mq.peek(cd.group.offset).?;
                                 // Write message to the stream, no wait and just +1
