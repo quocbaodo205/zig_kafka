@@ -31,8 +31,8 @@ pub fn initKAdmin() !void {
 
     _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
 
-    // const gpa = std.heap.smp_allocator;
-    const gpa = std.heap.c_allocator;
+    const gpa = std.heap.smp_allocator;
+    // const gpa = std.heap.c_allocator;
     // Set up our I/O implementation.
     var threaded: std.Io.Threaded = .init(gpa, .{ .environ = .empty });
     defer threaded.deinit();

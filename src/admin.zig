@@ -8,6 +8,7 @@ const iou = linux.IoUring;
 const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
 const topic = @import("topic.zig");
+const Partition = @import("partition.zig").Partition;
 
 const ADMIN_PORT: u16 = 10000;
 
@@ -33,22 +34,18 @@ pub const ConsumerData = struct {
     const Self = @This();
 
     port: u16,
-    group: *cgroup.CGroup,
-    topic: *topic.Topic,
     stream: net.Stream,
-    current_timeout: *std.os.linux.kernel_timespec,
+    topic: *topic.Topic,
+    group: *cgroup.CGroup,
+    partition: *Partition,
 
-    pub fn new(gpa: Allocator, port: u16, group: *cgroup.CGroup, tp: *topic.Topic, stream: net.Stream) !Self {
-        // Create a timespec of 10ms
-        const ts = try gpa.create(std.os.linux.kernel_timespec);
-        ts.sec = 0;
-        ts.nsec = 10000000;
+    pub fn new(port: u16, group: *cgroup.CGroup, tp: *topic.Topic, stream: net.Stream, partition: *Partition) !Self {
         return Self{
             .port = port,
             .stream = stream,
             .group = group,
             .topic = tp,
-            .current_timeout = ts,
+            .partition = partition,
         };
     }
 };
@@ -180,12 +177,15 @@ pub const KAdmin = struct {
                     // On done, also set topic states
                     for (t_self.topics.items) |*tp| {
                         std.debug.print("Terminating topic {}\n", .{tp.topic_id});
-                        tp.cond.broadcast(t_io);
                         tp.is_terminated = true;
                         for (tp.cgroups.items) |*cg| {
                             // Send a nop
                             _ = try cg.ring.nop(0);
                             _ = try cg.ring.submit();
+                            // Wake up all partition to die
+                            for (cg.partitions.items) |*pt| {
+                                pt.cond.broadcast(t_io);
+                            }
                             std.debug.print("Sent a nop to cgroup {}\n", .{cg.group_id});
                         }
                     }
@@ -280,7 +280,7 @@ pub const KAdmin = struct {
     }
 
     // =========================== Producer ======================
-    fn processProducerRegisterMessage(self: *Self, io: Io, group: *Io.Group, gpa: Allocator, rm: *const message_util.ProducerRegisterMessage) !u8 {
+    fn processProducerRegisterMessage(self: *Self, io: Io, _: *Io.Group, gpa: Allocator, rm: *const message_util.ProducerRegisterMessage) !u8 {
         // Connect to the server and add a stream to the list:
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
         const stream = try address.connect(io, .{ .mode = .stream });
@@ -301,7 +301,7 @@ pub const KAdmin = struct {
             // Persist to disk
             try self.writeOverallStateToFile(io);
             topic_o = &self.topics.items[self.topics.items.len - 1];
-            try group.concurrent(io, topic.Topic.tryPopMessage, .{ topic_o.?, io, gpa });
+            // try group.concurrent(io, topic.Topic.tryPopMessage, .{ topic_o.?, io, gpa });
         }
         if (topic_o) |tp| {
             const pd: *ProducerData = try gpa.create(ProducerData);
@@ -353,9 +353,11 @@ pub const KAdmin = struct {
             // Thread for handling consumer loop for this CGroup.
             try group.concurrent(io, handleConsumersLoop, .{ self, io, gpa, cg });
         }
-        // Add the port, stream and stream_state
+        // Add a new partition that this consumer will take data from.
+        try cg.partitions.append(gpa, Partition.new());
+        const pt = &cg.partitions.items[cg.partitions.items.len - 1];
         const cd = try gpa.create(ConsumerData);
-        cd.* = try ConsumerData.new(gpa, rm.port, cg, tp, stream);
+        cd.* = try ConsumerData.new(rm.port, cg, tp, stream, pt);
         try self.stream_list.append(gpa, stream);
         // Each consumer will send a ready to start receiving messages. This is just 1 byte.
         const cd_data = @intFromPtr(cd);
@@ -497,7 +499,6 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
             if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
                 std.debug.print("EOF from the consumer port = {}\n", .{cd.port});
                 // std.process.exit(1); // DEBUG
-                t_gpa.destroy(cd.current_timeout);
                 t_gpa.destroy(cd);
                 return true;
             }
@@ -521,7 +522,7 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
                         std.debug.print("Err handling consumer = {any}\n", .{err});
                         continue;
                     }
-                    var cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                    const cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
                     // Upon receive, it's a ready for sure.
                     if (try isHandledEOF(t_gpa, cqe, cd)) {
                         continue;
@@ -531,25 +532,25 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
                     // Good to be parsed. Ignore the length first byte.
                     if (message_util.parseMessage(data[0..])) |m| {
                         switch (m) {
-                            message_util.MessageType.R_C_PCM => |_| {
-                                // std.debug.print("Ready from consumer {}, fd = {}\n", .{ cd.port, cd.stream.socket.handle }); // DEBUG
-                                // Write the PCM to the consumer
-                                try cd.topic.mq_lock.lock(t_io);
-                                if (!cd.topic.mq.can_peek(cd.group.offset)) {
-                                    cd.topic.cond.waitUncancelable(t_io, &cd.topic.mq_lock);
+                            message_util.MessageType.R_C_PCM => {
+                                // std.debug.print("Got R_C_PCM for consumer = {}\n", .{cd.port}); // DEBUG
+                                try cd.partition.partition_lock.lock(t_io);
+                                var pcm = cd.partition.pop();
+                                if (pcm == null) {
+                                    // No message to be read. Wait until can read.
+                                    try cd.partition.cond.wait(t_io, &cd.partition.partition_lock);
+                                    // After wake up, try get again.
+                                    pcm = cd.partition.pop();
                                 }
-                                // After wake up, mq_lock is locked, and there's data so we can peek now.
-                                // If we cannot peek, it means that the wake up is for termination.
-                                if (!cd.topic.mq.can_peek(cd.group.offset)) {
-                                    std.debug.print("Wake up for termination in cg = {}\n", .{t_cg.group_id});
-                                    cd.topic.mq_lock.unlock(t_io);
-                                    continue;
+                                if (pcm != null) {
+                                    // Deref on write
+                                    try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.?.* });
+                                    t_gpa.free(pcm.?.message);
+                                    t_gpa.destroy(pcm.?);
+                                } else {
+                                    std.debug.print("Wake up to die for consumer {}\n", .{cd.port});
                                 }
-                                const pcm = cd.topic.mq.peek(cd.group.offset).?;
-                                // Write message to the stream, no wait and just +1
-                                try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.* });
-                                cd.group.offset += 1;
-                                cd.topic.mq_lock.unlock(t_io);
+                                cd.partition.partition_lock.unlock(t_io);
                             },
                             else => {
                                 // Not supported

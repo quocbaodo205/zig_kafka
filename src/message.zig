@@ -252,14 +252,14 @@ pub fn writeMessageToStream(stream_wr: *net.Stream.Writer, message: Message) !vo
             var data: [1]u8 = [1]u8{ack_byte};
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_PCM), &data);
         },
-        MessageType.C_RD => |_| {
+        MessageType.C_RD => {
             try writeJustTypeToStream(stream_wr, @intFromEnum(MessageType.C_RD));
         },
         MessageType.R_C_RD => |ack_byte| {
             var data: [1]u8 = [1]u8{ack_byte};
             try writeDataToStreamWithType(stream_wr, @intFromEnum(MessageType.R_C_RD), &data);
         },
-        MessageType.R_C_PCM => |_| {
+        MessageType.R_C_PCM => {
             try writeJustTypeToStream(stream_wr, @intFromEnum(MessageType.R_C_PCM));
         },
     }
