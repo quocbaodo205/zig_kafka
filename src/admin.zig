@@ -9,6 +9,7 @@ const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
 const topic = @import("topic.zig");
 const Partition = @import("partition.zig").Partition;
+const Queue = @import("queue.zig").Queue;
 
 const ADMIN_PORT: u16 = 10000;
 
@@ -19,6 +20,8 @@ pub const ProducerData = struct {
     port: u16,
     stream: net.Stream,
     data_buf: ?[]u8,
+    num_recv: u32,
+    eof: u8,
 
     pub fn new(tp: *topic.Topic, port: u16, stream: net.Stream) Self {
         return Self{
@@ -26,6 +29,8 @@ pub const ProducerData = struct {
             .port = port,
             .stream = stream,
             .data_buf = null,
+            .num_recv = 0,
+            .eof = 0,
         };
     }
 };
@@ -38,6 +43,8 @@ pub const ConsumerData = struct {
     topic: *topic.Topic,
     group: *cgroup.CGroup,
     partition: *Partition,
+    num_send: u32,
+    eof: u8,
 
     pub fn new(port: u16, group: *cgroup.CGroup, tp: *topic.Topic, stream: net.Stream, partition: *Partition) !Self {
         return Self{
@@ -46,6 +53,8 @@ pub const ConsumerData = struct {
             .group = group,
             .topic = tp,
             .partition = partition,
+            .num_send = 0,
+            .eof = 0,
         };
     }
 };
@@ -75,6 +84,12 @@ pub const KAdmin = struct {
     // A list of all stream to clean up.
     stream_list: std.ArrayList(net.Stream),
 
+    // Statistic for producer and consumer. Internal admin stats is inside topics
+    producer_stats: std.AutoArrayHashMap(u16, *ProducerData),
+    consumer_stats: std.AutoArrayHashMap(u16, *ConsumerData),
+
+    // A ring of buffer available for writing. These always exist.
+
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
@@ -90,6 +105,9 @@ pub const KAdmin = struct {
             .pbg = pbg,
             .cbg = cbg,
             .stream_list = try std.ArrayList(net.Stream).initCapacity(gpa, 10),
+            // Statistic
+            .producer_stats = std.AutoArrayHashMap(u16, *ProducerData).init(gpa),
+            .consumer_stats = std.AutoArrayHashMap(u16, *ConsumerData).init(gpa),
         };
     }
 
@@ -280,6 +298,7 @@ pub const KAdmin = struct {
     }
 
     // =========================== Producer ======================
+
     fn processProducerRegisterMessage(self: *Self, io: Io, _: *Io.Group, gpa: Allocator, rm: *const message_util.ProducerRegisterMessage) !u8 {
         // Connect to the server and add a stream to the list:
         const address = try net.IpAddress.parseIp4("127.0.0.1", rm.port);
@@ -306,6 +325,7 @@ pub const KAdmin = struct {
         if (topic_o) |tp| {
             const pd: *ProducerData = try gpa.create(ProducerData);
             pd.* = ProducerData.new(tp, rm.port, stream);
+            try self.producer_stats.put(rm.port, pd);
             try self.stream_list.append(gpa, stream);
             // std.debug.print("Registered a producer on port {}, topic {}\n", .{ rm.port, rm.topic });
             // Upon register, put it to the queue.
@@ -318,7 +338,6 @@ pub const KAdmin = struct {
 
     // ============================= Consumer ============================
 
-    /// Return the position of the consumer in the list
     fn processConsumerRegisterMessage(self: *Self, io: Io, group: *Io.Group, gpa: Allocator, rm: *const message_util.ConsumerRegisterMessage) !void {
         // Check if topic exist
         var exist = false;
@@ -351,13 +370,14 @@ pub const KAdmin = struct {
             try self.writeOverallStateToFile(io); //Persist to disk
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
             // Thread for handling consumer loop for this CGroup.
-            try group.concurrent(io, handleConsumersLoop, .{ self, io, gpa, cg });
+            try group.concurrent(io, handleCGroupConsumersLoop, .{ self, io, gpa, cg });
         }
         // Add a new partition that this consumer will take data from.
         try cg.partitions.append(gpa, Partition.new());
         const pt = &cg.partitions.items[cg.partitions.items.len - 1];
         const cd = try gpa.create(ConsumerData);
         cd.* = try ConsumerData.new(rm.port, cg, tp, stream, pt);
+        try self.consumer_stats.put(rm.port, cd);
         try self.stream_list.append(gpa, stream);
         // Each consumer will send a ready to start receiving messages. This is just 1 byte.
         const cd_data = @intFromPtr(cd);
@@ -397,13 +417,53 @@ pub const KAdmin = struct {
             },
         }
     }
+
+    /// Write statistic to stdout.
+    pub fn outputStatistic(self: *KAdmin, io: Io) !void {
+        var buf: [1024]u8 = undefined;
+        var wr = Io.File.stdout().writer(io, &buf);
+        // Clear screen first
+        try wr.interface.print("\x1b[2J", .{});
+        try wr.interface.print("\x1b[H", .{}); // Move top left again
+        for (self.topics.items) |*tp| {
+            try wr.interface.print("==========================================\n", .{});
+            try wr.interface.print("Topic {}: \n - #message added = {}\n", .{ tp.topic_id, tp.message_added });
+            // Output each cgroup stats
+            for (tp.cgroups.items) |*cg| {
+                try wr.interface.print("----------------------------\n", .{});
+                try wr.interface.print("Consumer group id = {} statistic:\n", .{cg.group_id});
+                var total_consumed: u32 = 0;
+                for (cg.partitions.items, 0..) |*pt, i| {
+                    total_consumed += pt.total_consumed;
+                    const ready: u1 = if (pt.is_ready) 1 else 0;
+                    try wr.interface.print("Partition {}: Ready = {}, Added = {}, consumed {}\n", .{ i, ready, pt.total_added, pt.total_consumed });
+                }
+                try wr.interface.print("Total consumed: {}\n", .{total_consumed});
+            }
+        }
+        // Stats for all producers:
+        try wr.interface.print("\n\nProducers: \n", .{});
+        var piter = self.producer_stats.iterator();
+
+        while (piter.next()) |entry| {
+            try wr.interface.print("Producer port = {}, topic {}, recv = {}, eof = {}\n", .{ entry.key_ptr.*, entry.value_ptr.*.topic.topic_id, entry.value_ptr.*.num_recv, entry.value_ptr.*.eof });
+        }
+
+        try wr.interface.print("\n\nConsumers: \n", .{});
+        var citer = self.consumer_stats.iterator();
+
+        while (citer.next()) |entry| {
+            try wr.interface.print("Consumer port = {}, topic {}, sent = {}, eof = {}\n", .{ entry.key_ptr.*, entry.value_ptr.*.topic.topic_id, entry.value_ptr.*.num_send, entry.value_ptr.*.eof });
+        }
+        try wr.interface.flush();
+    }
 };
 
 // =================================== Event loops ========================================
 
 /// Handle all producer messages in a loop of recv_multishot.
 /// These messages are supposed to be PCM.
-pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
+pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) !void {
     const temp = struct {
         /// Handle full message in the ProducerData
         fn handleFullPCMMessage(t_self: *KAdmin, t_io: Io, t_gpa: Allocator, pd: *ProducerData) !void {
@@ -414,6 +474,7 @@ pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
                         try t_self.writeMessageToFD(t_gpa, pd.stream.socket.handle, message_util.Message{
                             .R_PCM = 0,
                         });
+                        pd.num_recv += 1;
                     },
                     else => {
                         // Not supported
@@ -430,11 +491,11 @@ pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
         fn isHandledEOF(t_gpa: Allocator, cqe: linux.io_uring_cqe, pd: *ProducerData) bool {
             if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
                 // On EOF, recv_multishot is automatically cancel, so we just need to free
-                std.debug.print("EOF from the producer port = {}\n", .{pd.port});
                 if (pd.data_buf) |sl| {
                     t_gpa.free(sl);
                 }
-                t_gpa.destroy(pd);
+                pd.eof = 1;
+                // t_gpa.destroy(pd); // Don't really have to destroy, since statistic is still working...
                 return true;
             }
             return false;
@@ -491,15 +552,16 @@ pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) void {
     };
 }
 
-/// Handle all consumer messages in a loop of recv_multishot.
+/// Handle all consumer messages of a CGroup in a loop of recv_multishot.
 /// These are expected to be C_RD and R_C_PCM (1 byte only)
-pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CGroup) void {
+pub fn handleCGroupConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CGroup) !void {
     const temp = struct {
-        fn isHandledEOF(t_gpa: Allocator, cqe: linux.io_uring_cqe, cd: *ConsumerData) !bool {
+        fn isHandledEOF(_: Allocator, cqe: linux.io_uring_cqe, cd: *ConsumerData) bool {
             if (cqe.flags & std.os.linux.IORING_CQE_F_MORE == 0) {
                 std.debug.print("EOF from the consumer port = {}\n", .{cd.port});
                 // std.process.exit(1); // DEBUG
-                t_gpa.destroy(cd);
+                cd.eof = 1;
+                // t_gpa.destroy(cd); // Don't do it since statistic still need to get
                 return true;
             }
             return false;
@@ -524,7 +586,7 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
                     }
                     const cd: *ConsumerData = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
                     // Upon receive, it's a ready for sure.
-                    if (try isHandledEOF(t_gpa, cqe, cd)) {
+                    if (isHandledEOF(t_gpa, cqe, cd)) {
                         continue;
                     }
                     // Get and put back seems unneeded, but this is for clearing the buffer.
@@ -534,23 +596,29 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
                         switch (m) {
                             message_util.MessageType.R_C_PCM => {
                                 // std.debug.print("Got R_C_PCM for consumer = {}\n", .{cd.port}); // DEBUG
-                                try cd.partition.partition_lock.lock(t_io);
+                                var pt = cd.partition;
+                                try pt.partition_lock.lock(t_io);
+                                pt.is_ready = true;
                                 var pcm = cd.partition.pop();
                                 if (pcm == null) {
                                     // No message to be read. Wait until can read.
-                                    try cd.partition.cond.wait(t_io, &cd.partition.partition_lock);
+                                    try pt.cond.wait(t_io, &pt.partition_lock);
                                     // After wake up, try get again.
-                                    pcm = cd.partition.pop();
+                                    pcm = pt.pop();
                                 }
                                 if (pcm != null) {
                                     // Deref on write
                                     try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.?.* });
+                                    pt.total_consumed += 1; // Still in lock, can be done.
+                                    // Already pop, can just free
                                     t_gpa.free(pcm.?.message);
                                     t_gpa.destroy(pcm.?);
                                 } else {
                                     std.debug.print("Wake up to die for consumer {}\n", .{cd.port});
                                 }
-                                cd.partition.partition_lock.unlock(t_io);
+                                pt.is_ready = false;
+                                cd.num_send += 1;
+                                pt.partition_lock.unlock(t_io);
                             },
                             else => {
                                 // Not supported
@@ -571,10 +639,10 @@ pub fn handleConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgroup.CG
 
 /// Event loop to handle all write. These just return a buffer to us for now.
 /// If you need to handle different type of write, you can create a struct for it.
-pub fn handleWriteLoop(self: *KAdmin, gpa: Allocator) void {
+pub fn handleWriteLoop(self: *KAdmin, io: Io, gpa: Allocator) !void {
     const temp = struct {
-        pub fn handleWriteLoop(t_self: *KAdmin, t_gpa: Allocator) !void {
-            var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
+        pub fn handleWriteLoop(t_self: *KAdmin, t_io: Io, t_gpa: Allocator) !void {
+            var cqes: [1 << 4]std.os.linux.io_uring_cqe = undefined;
             // Event loop
             while (true) {
                 const num_write = try t_self.wring.copy_cqes(&cqes, 1);
@@ -602,10 +670,12 @@ pub fn handleWriteLoop(self: *KAdmin, gpa: Allocator) void {
                         t_gpa.destroy(wd);
                     }
                 }
+                // For anything written, clear the screen and output the statistic
+                try t_self.outputStatistic(t_io);
             }
         }
     };
-    temp.handleWriteLoop(self, gpa) catch |err| {
+    temp.handleWriteLoop(self, io, gpa) catch |err| {
         std.debug.print("Error handling loop = {any}\n", .{err});
     };
 }

@@ -42,7 +42,7 @@ pub fn initKAdmin() !void {
     var aring = try iou.init(8, 0);
     var pring = try iou.init(8, 0);
     var cring = try iou.init(8, 0);
-    var wring = try iou.init(8, 0);
+    var wring = try iou.init(16, 0);
     var pbg = try iou.BufferGroup.init(&pring, gpa, 10, 1024, 8);
     var cbg = try iou.BufferGroup.init(&cring, gpa, 11, 1024, 8);
     // Start needed threads for event loops
@@ -50,7 +50,7 @@ pub fn initKAdmin() !void {
     defer admin.deinit(gpa);
     try group.concurrent(io, kadmin.KAdmin.startAdminServer, .{ &admin, io, &group, gpa });
     try group.concurrent(io, kadmin.handleProducersLoop, .{ &admin, io, gpa });
-    try group.concurrent(io, kadmin.handleWriteLoop, .{ &admin, gpa });
+    try group.concurrent(io, kadmin.handleWriteLoop, .{ &admin, io, gpa });
     try group.await(io);
     std.debug.print("Everything stop in admin\n", .{});
     std.process.exit(0); // Terminate everything else

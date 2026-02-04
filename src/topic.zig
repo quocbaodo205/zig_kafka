@@ -16,12 +16,16 @@ pub const Topic = struct {
     topic_lock: Io.Mutex,
     is_terminated: bool,
 
+    // Statistic
+    message_added: u32,
+
     pub fn new(gpa: Allocator, topic_id: u32) !Self {
         return Self{
             .topic_id = topic_id,
             .cgroups = try std.ArrayList(CGroup).initCapacity(gpa, 10),
             .topic_lock = .init,
             .is_terminated = false,
+            .message_added = 0,
         };
     }
 
@@ -43,5 +47,9 @@ pub const Topic = struct {
             m_copy.timestamp = message.timestamp;
             try cg.add_message(io, m_copy);
         }
+        // Stats couting needs a lock
+        try self.topic_lock.lock(io);
+        self.message_added += 1;
+        self.topic_lock.unlock(io);
     }
 };

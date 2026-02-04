@@ -16,6 +16,9 @@ pub const CGroup = struct {
     partitions: std.ArrayList(Partition),
     cgroup_lock: Io.Mutex,
 
+    // Statistic
+    message_added: u32,
+
     pub fn new(gpa: Allocator, group_id: u32, topic_id: u32) !Self {
         const ring = try gpa.create(iou);
         ring.* = try iou.init(8, 0);
@@ -28,6 +31,7 @@ pub const CGroup = struct {
             .bg = bg,
             .partitions = try std.ArrayList(Partition).initCapacity(gpa, 3),
             .cgroup_lock = Io.Mutex.init,
+            .message_added = 0,
         };
     }
 
@@ -57,8 +61,10 @@ pub const CGroup = struct {
             // Lock again, repeat until can add message.
             try pt.partition_lock.lock(io);
         }
+        pt.total_added += 1;
         pt.partition_lock.unlock(io);
         pt.cond.broadcast(io); // Broadcast a new message has come.
+        self.message_added += 1;
         // std.debug.print("Done adding message to partition at pos = {}\n", .{min_i}); // DEBUG
     }
 

@@ -9,12 +9,18 @@ pub const Partition = struct {
     cond: Io.Condition,
     partition_lock: Io.Mutex,
     mq: queue.Queue(*ProduceConsumeMessage, 10000),
+    total_consumed: u32,
+    total_added: u32,
+    is_ready: bool,
 
     pub fn new() Self {
         return Self{
             .cond = .init,
             .partition_lock = .init,
             .mq = queue.Queue(*ProduceConsumeMessage, 10000).new(),
+            .total_consumed = 0,
+            .total_added = 0,
+            .is_ready = false,
         };
     }
 
