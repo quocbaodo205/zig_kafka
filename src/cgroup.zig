@@ -41,31 +41,32 @@ pub const CGroup = struct {
         try self.cgroup_lock.lock(io);
         defer self.cgroup_lock.unlock(io);
         // First, get partition with the minimal size
-        var min_i: usize = 0;
+        var min_partition: ?*Partition = null;
         var min_num: usize = 100000;
-        for (self.partitions.items, 0..) |*p, i| {
+        for (self.partitions.items) |*p| {
             if (p.len() < min_num) {
                 min_num = p.len();
-                min_i = i;
+                min_partition = p;
             }
         }
         // std.debug.print("Adding message to partition at pos = {}\n", .{min_i}); // DEBUG
         // Add to the min_i
         // Lock this partition, try to add it.
-        const pt = &self.partitions.items[min_i];
-        try pt.partition_lock.lock(io);
-        while (!pt.add(message)) {
-            pt.partition_lock.unlock(io);
-            // Sleep 1s to allow others to work on it.
-            try io.sleep(.fromSeconds(1), .awake);
-            // Lock again, repeat until can add message.
+        if (min_partition) |pt| {
             try pt.partition_lock.lock(io);
+            while (!pt.add(message)) {
+                pt.partition_lock.unlock(io);
+                // Sleep 1s to allow others to work on it.
+                try io.sleep(.fromSeconds(1), .awake);
+                // Lock again, repeat until can add message.
+                try pt.partition_lock.lock(io);
+            }
+            pt.total_added += 1;
+            pt.partition_lock.unlock(io);
+            pt.cond.broadcast(io); // Broadcast a new message has come.
+            self.message_added += 1;
+            // std.debug.print("Done adding message to partition at pos = {}\n", .{min_i}); // DEBUG
         }
-        pt.total_added += 1;
-        pt.partition_lock.unlock(io);
-        pt.cond.broadcast(io); // Broadcast a new message has come.
-        self.message_added += 1;
-        // std.debug.print("Done adding message to partition at pos = {}\n", .{min_i}); // DEBUG
     }
 
     pub fn deinit(self: *Self, gpa: Allocator) void {

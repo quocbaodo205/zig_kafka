@@ -9,7 +9,6 @@ const message_util = @import("message.zig");
 const cgroup = @import("cgroup.zig");
 const topic = @import("topic.zig");
 const Partition = @import("partition.zig").Partition;
-const Queue = @import("queue.zig").Queue;
 
 const ADMIN_PORT: u16 = 10000;
 
@@ -88,11 +87,26 @@ pub const KAdmin = struct {
     producer_stats: std.AutoArrayHashMap(u16, *ProducerData),
     consumer_stats: std.AutoArrayHashMap(u16, *ConsumerData),
 
-    // A ring of buffer available for writing. These always exist.
+    // A buffer available for writing. This always exist.
+    send_buf: [1024 * 100]u8,
+    send_buf_pos: usize,
+    send_buf_lock: Io.Mutex, // buffer position can be change in multiple threads.
 
     /// Init accept a buffer that will be used for all allocation and processing.
     pub fn init(gpa: Allocator, aring: *iou, pring: *iou, cring: *iou, wring: *iou, pbg: *iou.BufferGroup, cbg: *iou.BufferGroup) !Self {
         const address = try net.IpAddress.parseIp4("127.0.0.1", ADMIN_PORT);
+        const inspect_read = try gpa.create(message_util.ProduceConsumeMessage);
+        inspect_read.* = message_util.ProduceConsumeMessage{
+            .message = "",
+            .producer_port = 0,
+            .timestamp = 0,
+        };
+        const inspect_write = try gpa.create(message_util.ProduceConsumeMessage);
+        inspect_write.* = message_util.ProduceConsumeMessage{
+            .message = "",
+            .producer_port = 0,
+            .timestamp = 0,
+        };
         return Self{
             .admin_address = address,
             // Topics
@@ -108,6 +122,10 @@ pub const KAdmin = struct {
             // Statistic
             .producer_stats = std.AutoArrayHashMap(u16, *ProducerData).init(gpa),
             .consumer_stats = std.AutoArrayHashMap(u16, *ConsumerData).init(gpa),
+            // send buf
+            .send_buf = [_]u8{0} ** (1024 * 100),
+            .send_buf_pos = 0,
+            .send_buf_lock = .init,
         };
     }
 
@@ -367,7 +385,7 @@ pub const KAdmin = struct {
         }
         if (!exist) {
             try tp.addNewCGroup(io, gpa, rm.group_id);
-            try self.writeOverallStateToFile(io); //Persist to disk
+            // try self.writeOverallStateToFile(io); //Persist to disk
             cg = &tp.cgroups.items[tp.cgroups.items.len - 1];
             // Thread for handling consumer loop for this CGroup.
             try group.concurrent(io, handleCGroupConsumersLoop, .{ self, io, gpa, cg });
@@ -389,10 +407,14 @@ pub const KAdmin = struct {
 
     /// Write a message using `send` to a socket.
     /// Alloc and put the ptr to the user_data
-    fn writeMessageToFD(self: *KAdmin, gpa: Allocator, fd: net.Socket.Handle, message: message_util.Message) !void {
-        const buf = try gpa.alloc(u8, 1024);
+    fn writeMessageToFD(self: *KAdmin, io: Io, gpa: Allocator, fd: net.Socket.Handle, message: message_util.Message) !void {
+        try self.send_buf_lock.lock(io);
+        defer self.send_buf_lock.unlock(io);
+        var buf = self.send_buf[1024 * self.send_buf_pos .. 1024 * (self.send_buf_pos + 1)];
+        self.send_buf_pos += 1;
+        self.send_buf_pos %= 100;
         const wd = try gpa.create(WriteData);
-        wd.full_slice = buf; // dealloc on write done
+        wd.full_slice = buf;
         switch (message) {
             message_util.MessageType.PCM => |pcm| {
                 const data = try pcm.convertToBytesWithLengthAndType(buf);
@@ -427,7 +449,7 @@ pub const KAdmin = struct {
         try wr.interface.print("\x1b[H", .{}); // Move top left again
         for (self.topics.items) |*tp| {
             try wr.interface.print("==========================================\n", .{});
-            try wr.interface.print("Topic {}: \n - #message added = {}\n", .{ tp.topic_id, tp.message_added });
+            try wr.interface.print("Topic {}: #message added = {}\n", .{ tp.topic_id, tp.message_added });
             // Output each cgroup stats
             for (tp.cgroups.items) |*cg| {
                 try wr.interface.print("----------------------------\n", .{});
@@ -471,7 +493,7 @@ pub fn handleProducersLoop(self: *KAdmin, io: Io, gpa: Allocator) !void {
                 switch (m) {
                     message_util.MessageType.PCM => |pcm| {
                         try pd.topic.addMessage(t_io, t_gpa, &pcm); // Copy and Block until can add.
-                        try t_self.writeMessageToFD(t_gpa, pd.stream.socket.handle, message_util.Message{
+                        try t_self.writeMessageToFD(t_io, t_gpa, pd.stream.socket.handle, message_util.Message{
                             .R_PCM = 0,
                         });
                         pd.num_recv += 1;
@@ -567,7 +589,7 @@ pub fn handleCGroupConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgr
             return false;
         }
 
-        pub fn handleConsumersLoop(t_self: *KAdmin, t_io: Io, t_gpa: Allocator, t_cg: *cgroup.CGroup) !void {
+        pub fn handleCGroupConsumersLoop(t_self: *KAdmin, t_io: Io, t_gpa: Allocator, t_cg: *cgroup.CGroup) !void {
             var cqes: [1 << 3]std.os.linux.io_uring_cqe = undefined;
             while (true) {
                 // Multi recv, this can comes from multiple stream.
@@ -599,7 +621,7 @@ pub fn handleCGroupConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgr
                                 var pt = cd.partition;
                                 try pt.partition_lock.lock(t_io);
                                 pt.is_ready = true;
-                                var pcm = cd.partition.pop();
+                                var pcm = pt.pop();
                                 if (pcm == null) {
                                     // No message to be read. Wait until can read.
                                     try pt.cond.wait(t_io, &pt.partition_lock);
@@ -608,13 +630,17 @@ pub fn handleCGroupConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgr
                                 }
                                 if (pcm != null) {
                                     // Deref on write
-                                    try t_self.writeMessageToFD(t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.?.* });
+                                    try t_self.writeMessageToFD(t_io, t_gpa, cd.stream.socket.handle, message_util.Message{ .PCM = pcm.?.* });
                                     pt.total_consumed += 1; // Still in lock, can be done.
                                     // Already pop, can just free
                                     t_gpa.free(pcm.?.message);
                                     t_gpa.destroy(pcm.?);
                                 } else {
                                     std.debug.print("Wake up to die for consumer {}\n", .{cd.port});
+                                    while (pt.pop()) |p| {
+                                        t_gpa.free(p.message);
+                                        t_gpa.destroy(p);
+                                    }
                                 }
                                 pt.is_ready = false;
                                 cd.num_send += 1;
@@ -632,7 +658,7 @@ pub fn handleCGroupConsumersLoop(self: *KAdmin, io: Io, gpa: Allocator, cg: *cgr
             }
         }
     };
-    temp.handleConsumersLoop(self, io, gpa, cg) catch |err| {
+    temp.handleCGroupConsumersLoop(self, io, gpa, cg) catch |err| {
         std.debug.print("Error handling consumer loop = {any}\n", .{err});
     };
 }
@@ -666,7 +692,6 @@ pub fn handleWriteLoop(self: *KAdmin, io: Io, gpa: Allocator) !void {
                     } else {
                         // std.debug.print("Written full data to fd = {any}\n", .{wd.fd}); // DEBUG
                         // Free data on done
-                        t_gpa.free(wd.full_slice);
                         t_gpa.destroy(wd);
                     }
                 }

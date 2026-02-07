@@ -81,8 +81,16 @@ pub const ProducerProcess = struct {
         });
         // std.debug.print("Written {s} at {}\n", .{ message, ts });
         // Read back response echo message
-        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
-            // std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});
+        if (try message_util.readMessageFromStream(&stream_rd)) |m| {
+            switch (m) {
+                message_util.MessageType.R_PCM => {
+                    // std.debug.print("Got back from the admin: {}\n", .{m.R_PCM});
+                },
+                else => {
+                    std.debug.print("Does not support anything else but R_PCM", .{});
+                    @panic("Cannot support anything else but R_PCM");
+                },
+            }
         }
     }
 

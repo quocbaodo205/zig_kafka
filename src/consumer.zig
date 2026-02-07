@@ -83,13 +83,22 @@ pub const ConsumerProcess = struct {
         var stream_rd = self.stream.reader(io, &self.read_buffer);
         var stream_wr = self.stream.writer(io, &self.write_buffer);
         // Read PCM message
-        if (try message_util.readMessageFromStream(&stream_rd)) |_| {
-            // std.debug.print("Consumer {} receive message {s} from producer {} at ts = {}\n", .{ self.port, message.PCM.message, message.PCM.producer_port, message.PCM.timestamp }); // DEBUG
-            // Write response message
-            try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-                .R_C_PCM = {},
-            });
-            // std.debug.print("Consumer {} written back R_C_PCM ts = {}\n", .{ self.port, message.PCM.timestamp }); // DEBUG
+        if (try message_util.readMessageFromStream(&stream_rd)) |message| {
+            switch (message) {
+                message_util.MessageType.PCM => {
+                    // std.debug.print("Consumer {} receive message {s} from producer {} at ts = {}\n", .{ self.port, message.PCM.message, message.PCM.producer_port, message.PCM.timestamp }); // DEBUG
+                    // Write response message
+                    // std.debug.print("Consumer {} written back R_C_PCM ts = {}\n", .{ self.port, message.PCM.timestamp }); // DEBUG
+                    try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+                        .R_C_PCM = {},
+                    });
+                },
+                else => {
+                    // Does not support anything else
+                    std.debug.print("Got message = {any}\n", .{message});
+                    @panic("Does not accept anything but PCM!");
+                },
+            }
         }
     }
 
